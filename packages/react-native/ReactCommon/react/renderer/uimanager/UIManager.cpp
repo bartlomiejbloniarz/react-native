@@ -385,6 +385,8 @@ void UIManager::updateState(const StateUpdate& stateUpdate) const {
       "UIManager::updateState",
       "componentName",
       stateUpdate.family->getComponentName());
+  
+  LOG(INFO) << "UIManager->updateState" << std::endl;
   auto& callback = stateUpdate.callback;
   auto& family = stateUpdate.family;
   auto& componentDescriptor = family->getComponentDescriptor();

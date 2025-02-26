@@ -22,6 +22,7 @@
 #include <algorithm>
 #include <limits>
 #include <memory>
+#include <OSSLibraryExample/ShadowNodes.h>
 
 namespace facebook::react {
 
@@ -214,7 +215,13 @@ void YogaLayoutableShadowNode::adoptYogaChild(size_t index) {
   } else {
     // The child is owned by some other node, we need to clone that.
     // TODO: At this point, React has wrong reference to the node. (T138668036)
+    auto sampleShadowNode = std::dynamic_pointer_cast<const SampleNativeComponentShadowNode>(getChildren()[index]);
+    if (sampleShadowNode){
+      LOG(INFO) << "isSealed: " << childNode.getSealed() << std::endl;
+    }
     auto clonedChildNode = childNode.clone({});
+// uncomment next line to see the correct outcome (not sure if it is a proper solution though)
+//    auto clonedChildNode = childNode.clone({ShadowNodeFragment::propsPlaceholder(), ShadowNodeFragment::childrenPlaceholder(), childNode.getState()});
 
     // Replace the child node with a newly cloned one in the children list.
     replaceChild(childNode, clonedChildNode, index);

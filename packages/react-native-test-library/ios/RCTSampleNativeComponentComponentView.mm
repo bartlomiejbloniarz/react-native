@@ -9,6 +9,7 @@
 #import "OSSLibraryExampleSpec/EventEmitters.h"
 #import "OSSLibraryExampleSpec/Props.h"
 #import "OSSLibraryExampleSpec/RCTComponentViewHelpers.h"
+#import "OSSLibraryExampleSpec/States.h"
 
 #import "RCTFabricComponentsPlugins.h"
 
@@ -39,6 +40,7 @@ static UIColor *UIColorFromHexString(const std::string hexString)
 
 @implementation RCTSampleNativeComponentComponentView {
   UIView *_view;
+  SampleNativeComponentShadowNode::ConcreteState::Shared _state;
 }
 
 + (ComponentDescriptorProvider)componentDescriptorProvider
@@ -67,6 +69,12 @@ static UIColor *UIColorFromHexString(const std::string hexString)
   }
 
   return self;
+}
+
+- (void)updateState:(const facebook::react::State::Shared &)state oldState:(const facebook::react::State::Shared &)oldState
+{
+  _state = std::static_pointer_cast<const SampleNativeComponentShadowNode::ConcreteState>(state);
+  LOG(INFO) << "update state received: " << _state->getData().state <<std::endl;
 }
 
 - (void)updateProps:(const Props::Shared &)props oldProps:(const Props::Shared &)oldProps
@@ -128,6 +136,11 @@ static UIColor *UIColorFromHexString(const std::string hexString)
 
 - (void)changeBackgroundColor:(NSString *)color
 {
+  auto newStateData = SampleNativeComponentState{};
+  newStateData.state = 1;
+  
+  _state->updateState(std::move(newStateData));
+  
   _view.backgroundColor = UIColorFromHexString(std::string(color.UTF8String));
 }
 

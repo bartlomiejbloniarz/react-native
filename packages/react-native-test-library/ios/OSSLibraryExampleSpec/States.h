@@ -17,6 +17,7 @@ namespace facebook::react {
 class SampleNativeComponentState {
 public:
   SampleNativeComponentState() = default;
+  int state = 0;
 
 #ifdef ANDROID
   SampleNativeComponentState(SampleNativeComponentState const &previousState, folly::dynamic data){};

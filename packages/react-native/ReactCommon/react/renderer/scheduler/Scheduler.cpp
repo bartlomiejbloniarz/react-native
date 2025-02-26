@@ -24,6 +24,34 @@
 
 namespace facebook::react {
 
+
+// this function finds a node with nativeId == `clone-me`
+// and clones the entire path from this node to the root
+ShadowNode::Shared findAndClone(const ShadowNode::Shared& node){
+  if (node->getProps()->nativeId.compare("clone-me") == 0){
+    return node->clone({});
+  }
+  
+  auto children = node->getChildren();
+  for (int i=0; i<children.size(); i++){
+    auto &child = children[i];
+    auto maybeClone = findAndClone(child);
+    if (maybeClone != child){
+      children[i] = maybeClone;
+      return node->clone({ShadowNodeFragment::propsPlaceholder(), std::make_shared<ShadowNode::ListOfShared>(children)});
+    }
+  }
+  
+  // if the `clone-me` node is not in this subtree we do not clone anything here
+  return node;
+}
+
+RootShadowNode::Unshared BBCommitHook::shadowTreeWillCommit(const ShadowTree &shadowTree, const RootShadowNode::Shared &oldRootShadowNode, const RootShadowNode::Unshared &newRootShadowNode) noexcept {
+  LOG(INFO) << "commit hook";
+  auto result = findAndClone(newRootShadowNode);
+  return std::static_pointer_cast<RootShadowNode>(std::const_pointer_cast<ShadowNode>(result));
+}
+
 Scheduler::Scheduler(
     const SchedulerToolbox& schedulerToolbox,
     UIManagerAnimationDelegate* animationDelegate,
@@ -132,6 +160,8 @@ Scheduler::Scheduler(
   for (auto& commitHook : commitHooks_) {
     uiManager->registerCommitHook(*commitHook);
   }
+  
+  uiManager->registerCommitHook(bbCommitHook_);
 
   if (animationDelegate != nullptr) {
     animationDelegate->setComponentDescriptorRegistry(

@@ -31,6 +31,12 @@
 
 namespace facebook::react {
 
+struct BBCommitHook : public UIManagerCommitHook{
+  void commitHookWasRegistered(const UIManager &uiManager) noexcept override {}
+  void commitHookWasUnregistered(const UIManager &uiManager) noexcept override {}
+  RootShadowNode::Unshared shadowTreeWillCommit(const ShadowTree &shadowTree, const RootShadowNode::Shared &oldRootShadowNode, const RootShadowNode::Unshared &newRootShadowNode) noexcept override;
+};
+
 /*
  * Scheduler coordinates Shadow Tree updates and event flows.
  */
@@ -118,6 +124,7 @@ class Scheduler final : public UIManagerDelegate {
   std::shared_ptr<UIManager> uiManager_;
 
   std::vector<std::shared_ptr<UIManagerCommitHook>> commitHooks_;
+  BBCommitHook bbCommitHook_;
 
   /*
    * At some point, we have to have an owning shared pointer to something that
