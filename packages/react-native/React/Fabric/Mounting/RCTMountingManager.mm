@@ -262,6 +262,10 @@ static void RCTPerformMountInstructions(
         _observerCoordinator.notifyObserversMountingTransactionWillMount(transaction, surfaceTelemetry);
       },
       [&](const MountingTransaction &transaction, const SurfaceTelemetry &surfaceTelemetry) {
+        // DEMO: the REAL mount — views are applied to the screen here (main thread).
+        NSLog(@"[RNTMount] PERFORM t=%.4f mutations=%zu",
+              CACurrentMediaTime(),
+              transaction.getMutations().size());
         RCTPerformMountInstructions(
             transaction.getMutations(), _componentViewRegistry, _observerCoordinator, surfaceId);
       },

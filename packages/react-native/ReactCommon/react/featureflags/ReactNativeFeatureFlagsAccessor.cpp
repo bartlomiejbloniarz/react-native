@@ -18,6 +18,8 @@
  */
 
 #include <react/featureflags/ReactNativeFeatureFlagsDefaults.h>
+#include <cstdlib>
+#include <cstring>
 #include <sstream>
 #include <stdexcept>
 #include <string>
@@ -408,6 +410,18 @@ bool ReactNativeFeatureFlagsAccessor::enableExclusivePropsUpdateAndroid() {
 }
 
 bool ReactNativeFeatureFlagsAccessor::enableFabricCommitBranching() {
+  // DEMO: A/B the flag at launch via env RNT_COMMIT_BRANCHING=0|1, bypassing the provider.
+  static const int sEnvOverride = []() {
+    const char* e = std::getenv("RNT_COMMIT_BRANCHING");
+    if (e == nullptr) {
+      return -1;
+    }
+    return (std::strcmp(e, "0") != 0) ? 1 : 0;
+  }();
+  if (sEnvOverride >= 0) {
+    return sEnvOverride == 1;
+  }
+
   auto flagValue = enableFabricCommitBranching_.load();
 
   if (!flagValue.has_value()) {

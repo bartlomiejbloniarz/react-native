@@ -181,3 +181,152 @@ static NSString *kBundlePath = @"js/RNTesterApp.ios";
 }
 
 @end
+
+#pragma mark - RNTDemo (demo harness)
+
+#import <React/RCTBridgeModule.h>
+#import <QuartzCore/QuartzCore.h>
+
+@interface RNTDemo : NSObject <RCTBridgeModule>
+@end
+
+// source0 starvation trampolines (self-resignaling version-0 run-loop source that keeps
+// the main loop in poll==true, suppressing kCFRunLoopBeforeWaiting for several frames).
+static void RNTDemoPerform(void *info);
+static void RNTDemoObserver(CFRunLoopObserverRef obs, CFRunLoopActivity act, void *info);
+
+@implementation RNTDemo {
+  CFRunLoopSourceRef _source;
+  CFRunLoopObserverRef _observer;
+  BOOL _active;
+  NSInteger _burstRemaining;
+  NSInteger _burstLength;
+  double _busyMs;
+}
+
+RCT_EXPORT_MODULE(RNTDemo);
+
+- (dispatch_queue_t)methodQueue
+{
+  return dispatch_get_main_queue(); // so blockMainThread actually blocks the main thread
+}
+
++ (BOOL)requiresMainQueueSetup
+{
+  return YES;
+}
+
+RCT_EXPORT_METHOD(blockMainThread : (double)ms)
+{
+  usleep((useconds_t)(ms * 1000.0));
+}
+
+RCT_EXPORT_METHOD(mark : (NSString *)label)
+{
+  NSLog(@"[RNTProbe] MARK %@ t=%.4f", label, CACurrentMediaTime());
+}
+
+#pragma mark - BeforeWaiting starvation (source0)
+
+static NSInteger sBW = 0;
+static NSInteger sPerform = 0;
+static CFTimeInterval sT0 = 0;
+
+static void RNTDemoTick(void)
+{
+  CFTimeInterval now = CACurrentMediaTime();
+  if (sT0 == 0) {
+    sT0 = now;
+  }
+  if (now - sT0 >= 1.0) {
+    NSLog(@"[RNTStarve] BeforeWaiting/s=%ld source0Perform/s=%ld", (long)sBW, (long)sPerform);
+    sBW = 0;
+    sPerform = 0;
+    sT0 = now;
+  }
+}
+
+- (void)installIfNeeded
+{
+  if (_source) {
+    return;
+  }
+  CFRunLoopSourceContext sctx;
+  memset(&sctx, 0, sizeof(sctx));
+  sctx.info = (__bridge void *)self;
+  sctx.perform = RNTDemoPerform;
+  _source = CFRunLoopSourceCreate(kCFAllocatorDefault, 0 /* version 0 == source0 */, &sctx);
+  CFRunLoopAddSource(CFRunLoopGetMain(), _source, kCFRunLoopCommonModes);
+
+  CFRunLoopObserverContext octx;
+  memset(&octx, 0, sizeof(octx));
+  octx.info = (__bridge void *)self;
+  _observer = CFRunLoopObserverCreate(
+      kCFAllocatorDefault, kCFRunLoopBeforeWaiting, true, 0, RNTDemoObserver, &octx);
+  CFRunLoopAddObserver(CFRunLoopGetMain(), _observer, kCFRunLoopCommonModes);
+}
+
+- (void)kickBurst
+{
+  _burstRemaining = _burstLength;
+  CFRunLoopSourceSignal(_source);
+  CFRunLoopWakeUp(CFRunLoopGetMain());
+}
+
+- (void)performBurst
+{
+  if (!_active || _burstRemaining <= 0) {
+    return;
+  }
+  sPerform++;
+  _burstRemaining--;
+  CFTimeInterval deadline = CACurrentMediaTime() + _busyMs / 1000.0;
+  volatile double x = 0;
+  while (CACurrentMediaTime() < deadline) {
+    x += 1.0;
+    if (x > 1e12) {
+      x = 0;
+    }
+  }
+  if (_burstRemaining > 0) {
+    CFRunLoopSourceSignal(_source); // keep poll==true next iteration
+    CFRunLoopWakeUp(CFRunLoopGetMain());
+  }
+}
+
+- (void)onBeforeWaiting
+{
+  sBW++;
+  RNTDemoTick();
+  if (!_active) {
+    return;
+  }
+  [self kickBurst]; // re-arm so starvation is periodic (one BeforeWaiting per cycle)
+}
+
+RCT_EXPORT_METHOD(startStarve : (double)burstLength busyMs : (double)busyMs)
+{
+  _burstLength = burstLength > 0 ? (NSInteger)burstLength : 12;
+  _busyMs = busyMs > 0 ? busyMs : 8.0;
+  [self installIfNeeded];
+  _active = YES;
+  [self kickBurst];
+}
+
+RCT_EXPORT_METHOD(stopStarve)
+{
+  _active = NO;
+  _burstRemaining = 0;
+}
+
+@end
+
+static void RNTDemoPerform(void *info)
+{
+  [(__bridge RNTDemo *)info performBurst];
+}
+
+static void RNTDemoObserver(__unused CFRunLoopObserverRef obs, __unused CFRunLoopActivity act, void *info)
+{
+  [(__bridge RNTDemo *)info onBeforeWaiting];
+}

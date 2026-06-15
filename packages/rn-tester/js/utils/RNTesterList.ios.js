@@ -159,6 +159,10 @@ const Components: Array<RNTesterModuleInfo> = [
 const APIs: Array<RNTesterModuleInfo> = (
   [
     {
+      key: 'CommitBranchingExample',
+      module: require('../examples/CommitBranching/CommitBranchingExample'),
+    },
+    {
       key: 'AccessibilityExample',
       module: require('../examples/Accessibility/AccessibilityExample'),
     },

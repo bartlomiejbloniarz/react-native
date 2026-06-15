@@ -384,6 +384,11 @@ class ReactRevisionMergeRunLoopObserverDelegate final : public RunLoopObserver::
     pending.swap(_pendingReactRevisionMerges);
   }
 
+  // DEMO: merges are drained here, from the kCFRunLoopBeforeWaiting observer. Logging the
+  // drain count surfaces collapse: >1 surface (or repeated bursts) means several promotions
+  // waited for one BeforeWaiting.
+  NSLog(@"[RNTMerge] drain surfaces=%zu t=%.4f", pending.size(), CACurrentMediaTime());
+
   for (auto surfaceId : pending) {
     [self _mergeReactRevisionForSurfaceId:surfaceId];
   }
