@@ -28,6 +28,14 @@
 
 using namespace facebook::react;
 
+// DEMO: time-to-mount tracking. RNTDemo (AppDelegate.mm) records the press time here, and
+// RCTPerformMountInstructions logs the delta when the tracked nativeID ("probe...") mounts.
+#include <atomic>
+static std::atomic<double> gRNTProbePress{0};
+extern "C" void RNTSetProbePress(double t) {
+  gRNTProbePress.store(t);
+}
+
 static SurfaceId RCTSurfaceIdForView(UIView *view)
 {
   do {
@@ -49,6 +57,17 @@ static void RCTPerformMountInstructions(
   TraceSection s("RCTPerformMountInstructions");
 
   for (const auto &mutation : mutations) {
+    // DEMO: log the mount time of the tracked component, identified by its nativeID.
+    if ((mutation.type == ShadowViewMutation::Create || mutation.type == ShadowViewMutation::Update) &&
+        mutation.newChildShadowView.props != nullptr) {
+      const auto &nativeId = mutation.newChildShadowView.props->nativeId;
+      if (nativeId.rfind("probe", 0) == 0) {
+        double now = CACurrentMediaTime();
+        NSLog(@"[RNTMount] nativeID=%s mounted; timeToMount=%.1f ms",
+              nativeId.c_str(),
+              (now - gRNTProbePress.load()) * 1000.0);
+      }
+    }
     switch (mutation.type) {
       case ShadowViewMutation::Create: {
         auto &newChildShadowView = mutation.newChildShadowView;

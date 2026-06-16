@@ -186,6 +186,47 @@ static NSString *kBundlePath = @"js/RNTesterApp.ios";
 
 #import <React/RCTBridgeModule.h>
 #import <QuartzCore/QuartzCore.h>
+#import <objc/runtime.h>
+#import <react/featureflags/ReactNativeFeatureFlags.h>
+#include <atomic>
+
+extern "C" void RNTSetProbePress(double t); // defined in RCTMountingManager.mm
+
+// Perceived-latency probe. markPress() runs on methodQueue==main, so under the jank it can be
+// delayed together with the mount — making timeToMount (their difference) look tiny while the
+// user still waits. To measure the part timeToMount can't see (touch -> handler), we swizzle
+// -[UIApplication sendEvent:] to stamp the time of the most recent touch-down, then markPress
+// logs tapToHandler = now - thatStamp.
+static std::atomic<double> gRNTLastTouchDown{0};
+
+// Set by RNTJS.markJS (a module on a BACKGROUND queue, called first from the JS Update
+// handler). Lets us split tapToHandler into (touch -> JS handler), which lands here off the
+// main thread, vs (JS handler -> main-queue drain), which is markPress running on main.
+static std::atomic<double> gRNTJSHandler{0};
+
+@implementation UIApplication (RNTTouchProbe)
+- (void)rnt_sendEvent:(UIEvent *)event
+{
+  if (event.type == UIEventTypeTouches) {
+    for (UITouch *t in event.allTouches) {
+      if (t.phase == UITouchPhaseBegan) {
+        gRNTLastTouchDown.store(CACurrentMediaTime());
+        break;
+      }
+    }
+  }
+  [self rnt_sendEvent:event]; // swizzled -> original sendEvent:
+}
++ (void)load
+{
+  static dispatch_once_t once;
+  dispatch_once(&once, ^{
+    method_exchangeImplementations(
+        class_getInstanceMethod(self, @selector(sendEvent:)),
+        class_getInstanceMethod(self, @selector(rnt_sendEvent:)));
+  });
+}
+@end
 
 @interface RNTDemo : NSObject <RCTBridgeModule>
 @end
@@ -202,6 +243,9 @@ static void RNTDemoObserver(CFRunLoopObserverRef obs, CFRunLoopActivity act, voi
   NSInteger _burstRemaining;
   NSInteger _burstLength;
   double _busyMs;
+  CFTimeInterval _cycleDeadline;
+  CADisplayLink *_jankLink;
+  double _jankMs;
 }
 
 RCT_EXPORT_MODULE(RNTDemo);
@@ -224,6 +268,64 @@ RCT_EXPORT_METHOD(blockMainThread : (double)ms)
 RCT_EXPORT_METHOD(mark : (NSString *)label)
 {
   NSLog(@"[RNTProbe] MARK %@ t=%.4f", label, CACurrentMediaTime());
+}
+
+// Records the moment the user pressed "Update" so the mount log can print timeToMount.
+RCT_EXPORT_METHOD(markPress)
+{
+  double now = CACurrentMediaTime();
+  RNTSetProbePress(now);
+  double td = gRNTLastTouchDown.load();
+  double js = gRNTJSHandler.load();
+  if (td > 0) {
+    // touch-down -> this handler running on main. This is the latency timeToMount can't see.
+    // Split: touchToJs (hop 1, touch -> JS handler, lands off-main in RNTJS.markJS) and
+    // jsToMain (hop 2, JS handler -> this main-queue method actually running).
+    NSLog(@"[RNTProbe] tapToHandler=%.1f ms  touchToJs=%.1f ms  jsToMain=%.1f ms",
+          (now - td) * 1000.0,
+          js > 0 ? (js - td) * 1000.0 : -1.0,
+          js > 0 ? (now - js) * 1000.0 : -1.0);
+  }
+}
+
+// Lets the JS UI show whether enableFabricCommitBranching is actually on.
+RCT_EXPORT_METHOD(getBranching : (RCTResponseSenderBlock)callback)
+{
+  callback(@[ @(facebook::react::ReactNativeFeatureFlags::enableFabricCommitBranching()) ]);
+}
+
+#pragma mark - Jank (CADisplayLink burning busyMs/frame)
+
+// A CADisplayLink that busy-spins for `busyMs` every vsync. Because busyMs > the frame
+// interval, the next vsync is always already pending when the tick returns, so the run
+// loop grabs it (poll==true) and runs the next tick WITHOUT ever sleeping — i.e. it keeps
+// kCFRunLoopBeforeWaiting from firing. This is the realistic "sustained over-budget
+// frames" shape (a heavy per-frame animation), not a single synchronous freeze.
+- (void)jankTick:(CADisplayLink *)link
+{
+  CFTimeInterval deadline = CACurrentMediaTime() + _jankMs / 1000.0;
+  volatile double x = 0;
+  while (CACurrentMediaTime() < deadline) {
+    x += 1.0;
+    if (x > 1e12) {
+      x = 0;
+    }
+  }
+}
+
+RCT_EXPORT_METHOD(startJank : (double)busyMs)
+{
+  _jankMs = busyMs > 0 ? busyMs : 20.0;
+  if (_jankLink == nil) {
+    _jankLink = [CADisplayLink displayLinkWithTarget:self selector:@selector(jankTick:)];
+    [_jankLink addToRunLoop:[NSRunLoop mainRunLoop] forMode:NSRunLoopCommonModes];
+  }
+  _jankLink.paused = NO;
+}
+
+RCT_EXPORT_METHOD(stopJank)
+{
+  _jankLink.paused = YES;
 }
 
 #pragma mark - BeforeWaiting starvation (source0)
@@ -268,29 +370,33 @@ static void RNTDemoTick(void)
 
 - (void)kickBurst
 {
-  _burstRemaining = _burstLength;
+  // Spin (cheaply) for one cycle worth of wall-clock: burstLength * busyMs.
+  _cycleDeadline = CACurrentMediaTime() + (_burstLength * _busyMs) / 1000.0;
   CFRunLoopSourceSignal(_source);
   CFRunLoopWakeUp(CFRunLoopGetMain());
 }
 
 - (void)performBurst
 {
-  if (!_active || _burstRemaining <= 0) {
+  if (!_active) {
     return;
   }
   sPerform++;
-  _burstRemaining--;
-  CFTimeInterval deadline = CACurrentMediaTime() + _busyMs / 1000.0;
-  volatile double x = 0;
-  while (CACurrentMediaTime() < deadline) {
-    x += 1.0;
-    if (x > 1e12) {
-      x = 0;
-    }
-  }
-  if (_burstRemaining > 0) {
+  // Cheap, NON-blocking: re-signal and return. The run loop stays in poll==true
+  // (BeforeWaiting suppressed) for the whole cycle, but because we return to the loop on
+  // every iteration it still services the touch mach-port and the main-queue dispatch port
+  // between re-signals — so input/JS/the dispatch-port mount are NOT starved (only the
+  // flag-ON BeforeWaiting merge is). When the cycle deadline passes we stop re-signaling,
+  // the loop reaches BeforeWaiting once, and onBeforeWaiting re-arms.
+  if (CACurrentMediaTime() < _cycleDeadline) {
+    // Yield the core for a sliver so the main thread isn't pegged at 100%. Pegging it (and
+    // the old per-iteration CFRunLoopWakeUp flood) added variable latency to touch delivery
+    // and the dispatch-port mount even with the flag OFF. 250us is imperceptible but it
+    // drops the spin from ~1.2M/s to a few thousand/s. No CFRunLoopWakeUp: the loop is
+    // already running (poll==true ⇒ zero-timeout wait, never sleeps), so the signal alone
+    // is picked up next iteration; waking it every iteration only floods the mach port.
+    usleep(250);
     CFRunLoopSourceSignal(_source); // keep poll==true next iteration
-    CFRunLoopWakeUp(CFRunLoopGetMain());
   }
 }
 
@@ -317,6 +423,33 @@ RCT_EXPORT_METHOD(stopStarve)
 {
   _active = NO;
   _burstRemaining = 0;
+}
+
+@end
+
+// Background-queue probe: stamps the moment the JS Update handler reached native (off the main
+// thread, so it is NOT subject to the jank's main-queue draining). Compared against markPress
+// (main queue) this isolates which hop the jank actually delays.
+@interface RNTJS : NSObject <RCTBridgeModule>
+@end
+
+@implementation RNTJS
+
+RCT_EXPORT_MODULE(RNTJS);
+
+- (dispatch_queue_t)methodQueue
+{
+  static dispatch_queue_t q;
+  static dispatch_once_t once;
+  dispatch_once(&once, ^{
+    q = dispatch_queue_create("com.rntester.jsprobe", DISPATCH_QUEUE_SERIAL);
+  });
+  return q;
+}
+
+RCT_EXPORT_METHOD(markJS)
+{
+  gRNTJSHandler.store(CACurrentMediaTime());
 }
 
 @end

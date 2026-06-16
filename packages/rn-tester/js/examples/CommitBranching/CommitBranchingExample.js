@@ -7,139 +7,141 @@
  * @format
  */
 
+// @flow
 'use strict';
 
 const React = require('react');
-const {useEffect, useState} = React;
-const {Button, NativeModules, StyleSheet, Switch, Text, View} =
-  require('react-native');
+const {
+  Button,
+  NativeModules,
+  StyleSheet,
+  Switch,
+  Text,
+  View,
+} = require('react-native');
 
-// Native demo harness (RNTester/AppDelegate.mm):
-//   blockMainThread(ms) — sleeps the MAIN thread for `ms` (one heavy transition frame).
-//   mark(label)         — logs a timestamp so the native [RNTProbe] MOUNT-TX log can
-//                         measure navigate -> first-content-mount (TTRC).
-// blockMainThread has to be native: JS runs on its own thread and cannot occupy the
-// main thread. Everything else here is plain JS.
+const {useEffect, useRef, useState} = React;
+
 const RNTDemo = NativeModules.RNTDemo;
+const RNTJS = NativeModules.RNTJS;
 
 /*
- * enableFabricCommitBranching TTRC regression — minimal repro.
+ * enableFabricCommitBranching jank — minimal repro.
  *
- * The new screen's content is a React commit. With the flag ON it does NOT mount
- * inline; it is deferred to the React branch and only mounts after an extra hop:
+ * Since #56726, a React-branch commit's merge is drained from a kCFRunLoopBeforeWaiting
+ * main run loop observer (RCTSurfacePresenter). The "Jank" switch installs a source0 that
+ * re-signals itself every iteration so the run loop stays in poll==true and never reaches
+ * its sleep point, so BeforeWaiting never fires (for ~one cycle, then it re-arms).
  *
- *     commit -> React branch -> RuntimeScheduler promotion (JS)
- *            -> RCTExecuteOnMainQueue(merge)  <-- extra async hop, main queue
- *            -> mount
+ *   flag ON : the component's merge waits for a BeforeWaiting that isn't coming → its
+ *             mount is starved for ~one jank cycle (the box visibly lags each press).
+ *   flag OFF: the component mounts via the main-queue dispatch port (serviced even while
+ *             the loop never sleeps) → it updates immediately.
  *
- * That extra `RCTExecuteOnMainQueue` merge (RCTSurfacePresenter.mm) is a second
- * main-thread round-trip. When a tab/stack transition keeps the main thread busy with
- * long synchronous frames, the merge is queued behind that work, so the incoming
- * screen's first content mounts ~one extra transition-frame late.
+ * IMPORTANT — the source0 perform is CHEAP (just re-signal + return); it does NOT busy-wait.
+ * That is the whole point: a busy-waiting source0 also pins the main thread, so it delays
+ * the *touch event and JS* too (you'd see lag even with the flag OFF). By returning to the
+ * run loop on every iteration, input and the dispatch-port mount are still serviced between
+ * re-signals — only the flag-ON BeforeWaiting merge is starved, so the flag is the *only*
+ * difference you feel. (A single long sleep delays both flags equally; a CADisplayLink that
+ * overruns the frame still SLEEPS until the next vsync so it does NOT reproduce.)
  *
- * Repro: tap "Navigate" with "Simulate janky transition" ON.
- *   - Flag OFF: new content appears quickly.
- *   - Flag ON : new content appears noticeably later (it waits for the merge hop to
- *               get through the transition's busy frames).
- * Watch the [RNTProbe] device log: NAVIGATE -> MOUNT-TX is the measured TTRC.
- *
- * Flip the flag at launch (no rebuild):
- *   xcrun simctl terminate <udid> com.meta.RNTester.localDevelopment
- *   SIMCTL_CHILD_RNT_COMMIT_BRANCHING=1 xcrun simctl launch <udid> com.meta.RNTester.localDevelopment  # ON
- *   SIMCTL_CHILD_RNT_COMMIT_BRANCHING=0 xcrun simctl launch <udid> com.meta.RNTester.localDevelopment  # OFF
+ * Tap "Update component" with Jank on and watch the device log:
+ *   [RNTMount] nativeID=probe-<n> mounted; timeToMount=<ms>
+ *   flag ON ≈ hundreds of ms, flag OFF ≈ a few ms.
  */
 
-const BLOCK_MS = 300; // length of each synchronous "transition frame"
-const TRANSITION_MS = 1500; // how long the janky transition runs
+function CommitBranchingJank() /*: React.Node */ {
+  const [branching, setBranching] = useState(null /*: ?boolean */);
+  const [jank, setJank] = useState(false);
+  const [auto, setAuto] = useState(false);
+  const [count, setCount] = useState(0);
+  const intervalRef = useRef(null /*: ?IntervalID */);
 
-// A JS loop of main-thread blocks = repeated long busy frames with brief gaps in
-// between (the shape that delays the branch merge hop).
-function runJankyTransition() {
-  if (RNTDemo == null) {
-    return;
-  }
-  const end = Date.now() + TRANSITION_MS;
-  const step = () => {
-    if (Date.now() >= end) {
-      return;
-    }
-    RNTDemo.blockMainThread(BLOCK_MS); // freezes the main thread for one "frame"
-    setTimeout(step, 0); // yield, then block again
-  };
-  step();
-}
-
-function CommitBranchingTTRC() /*: React.Node */ {
-  const [jank, setJank] = useState(true);
-  const [screen, setScreen] = useState(0); // 0 = nothing navigated yet
-
-  // Per-frame animation: one setState per requestAnimationFrame == one React commit per
-  // frame == (when not starved) one real mount per frame. Used with startStarve below to
-  // ask: does suppressing BeforeWaiting for several frames collapse the *mounts*?
-  const [anim, setAnim] = useState(false);
-  const [tick, setTick] = useState(0);
   useEffect(() => {
-    if (!anim) {
+    RNTDemo && RNTDemo.getBranching(v => setBranching(!!v));
+    return () => {
+      if (intervalRef.current != null) {
+        clearInterval(intervalRef.current);
+      }
+    };
+  }, []);
+
+  // Drive updates from a JS interval — this NEVER touches the native->JS event beat (no
+  // touch), so it isolates the commit->mount path. Throughput = how many of these actually
+  // mount per second (count the [RNTMount] log lines): OFF keeps up with the interval, ON
+  // collapses to the BeforeWaiting rate (~2/s) and coalesces, so the counter jumps in leaps.
+  const toggleAuto = (on /*: boolean */) => {
+    setAuto(on);
+    if (intervalRef.current != null) {
+      clearInterval(intervalRef.current);
+      intervalRef.current = null;
+    }
+    if (on) {
+      intervalRef.current = setInterval(() => setCount(c => c + 1), 16);
+    }
+  };
+
+  const toggleJank = (on /*: boolean */) => {
+    setJank(on);
+    if (RNTDemo == null) {
       return;
     }
-    let raf = 0;
-    let cancelled = false;
-    let n = 0;
-    const loop = () => {
-      if (cancelled) {
-        return;
-      }
-      n += 1;
-      globalThis.__rafCount = n; // read via debugger to get the real commit rate
-      setTick(n);
-      raf = requestAnimationFrame(loop);
-    };
-    raf = requestAnimationFrame(loop);
-    return () => {
-      cancelled = true;
-      cancelAnimationFrame(raf);
-    };
-  }, [anim]);
+    // Cheap self-re-signaling source0 that keeps the loop in poll==true (no sleep) for a
+    // ~600ms cycle (30 * 20ms), then re-arms. NOT busy-waiting — input stays responsive.
+    on ? RNTDemo.startStarve(30, 20) : RNTDemo.stopStarve();
+  };
 
-  const navigate = () => {
-    RNTDemo && RNTDemo.mark('NAVIGATE');
-    setScreen(n => n + 1); // mount brand-new content (a React commit)
-    if (jank) {
-      runJankyTransition(); // ...while a heavy transition hogs the main thread
-    }
+  const update = () => {
+    RNTJS && RNTJS.markJS(); // stamp when the JS handler ran (background queue, jank-free)
+    RNTDemo && RNTDemo.markPress(); // stamp t0 (main queue) so native logs timeToMount + split
+    setCount(c => c + 1);
   };
 
   return (
     <View style={styles.container}>
-      <Text style={styles.title}>Commit Branching — TTRC</Text>
+      <Text style={styles.title}>Commit Branching jank</Text>
+
+      <View
+        style={[
+          styles.badge,
+          branching == null
+            ? styles.badgeUnknown
+            : branching
+              ? styles.badgeOn
+              : styles.badgeOff,
+        ]}>
+        <Text style={styles.badgeText}>
+          enableFabricCommitBranching:{' '}
+          {branching == null ? '…' : branching ? 'ON' : 'OFF'}
+        </Text>
+      </View>
+
       <Text style={styles.blurb}>
-        Tap Navigate with the transition ON. With enableFabricCommitBranching ON the new
-        screen's content appears ~one transition-frame late (its branch merge is queued
-        behind the main-thread work); with the flag OFF it appears promptly. The
-        [RNTProbe] log prints NAVIGATE → MOUNT-TX = the TTRC.
+        Turn on Jank (a cheap self-re-signaling source0 keeps the run loop in
+        poll==true so it never sleeps and BeforeWaiting never fires — but it does
+        NOT busy-wait, so taps stay responsive), then tap Update. With branching
+        ON the component's mount is starved ~one cycle (visible lag each press);
+        with it OFF it updates right away. See the device log: [RNTMount]
+        nativeID=probe-N timeToMount=…
       </Text>
 
       <View style={styles.row}>
-        <Text style={styles.rowLabel}>Simulate janky transition</Text>
-        <Switch value={jank} onValueChange={setJank} />
+        <Text style={styles.rowLabel}>Jank (never-sleep, non-blocking)</Text>
+        <Switch value={jank} onValueChange={toggleJank} />
       </View>
 
       <View style={styles.row}>
-        <Text style={styles.rowLabel}>Run rAF animation (tick {tick})</Text>
-        <Switch value={anim} onValueChange={setAnim} />
+        <Text style={styles.rowLabel}>Auto-update (interval, throughput)</Text>
+        <Switch value={auto} onValueChange={toggleAuto} />
       </View>
 
-      <Button title="Navigate to new screen" onPress={navigate} />
+      <Button title="Update component" onPress={update} />
 
       <View style={styles.stage}>
-        {screen === 0 ? (
-          <Text style={styles.placeholder}>no screen yet — tap Navigate</Text>
-        ) : (
-          <View style={styles.screen} testID="ttrc-screen">
-            <Text style={styles.screenTitle}>SCREEN #{screen}</Text>
-            <Text style={styles.screenBody}>first content — this is what TTRC measures</Text>
-          </View>
-        )}
+        <View nativeID={'probe-' + count} style={styles.probe}>
+          <Text style={styles.probeText}>update #{count}</Text>
+        </View>
       </View>
     </View>
   );
@@ -147,8 +149,24 @@ function CommitBranchingTTRC() /*: React.Node */ {
 
 const styles = StyleSheet.create({
   container: {flex: 1, padding: 16},
-  title: {fontSize: 22, fontWeight: '800', marginBottom: 8},
-  blurb: {fontSize: 13, color: '#555', marginBottom: 16, lineHeight: 18},
+  title: {fontSize: 22, fontWeight: '800', marginBottom: 10},
+  badge: {
+    alignSelf: 'flex-start',
+    paddingHorizontal: 10,
+    paddingVertical: 5,
+    borderRadius: 6,
+  },
+  badgeUnknown: {backgroundColor: '#999'},
+  badgeOn: {backgroundColor: '#16a34a'},
+  badgeOff: {backgroundColor: '#6b7280'},
+  badgeText: {color: '#fff', fontWeight: '700', fontSize: 13},
+  blurb: {
+    fontSize: 13,
+    color: '#555',
+    marginTop: 12,
+    marginBottom: 16,
+    lineHeight: 18,
+  },
   row: {
     flexDirection: 'row',
     alignItems: 'center',
@@ -156,30 +174,29 @@ const styles = StyleSheet.create({
     marginBottom: 12,
   },
   rowLabel: {fontSize: 15},
-  stage: {flex: 1, marginTop: 20, justifyContent: 'center'},
-  placeholder: {textAlign: 'center', color: '#999'},
-  screen: {
-    padding: 24,
+  stage: {marginTop: 28, alignItems: 'center'},
+  probe: {
+    padding: 28,
     borderRadius: 14,
     backgroundColor: '#f59e0b',
     alignItems: 'center',
+    minWidth: 200,
   },
-  screenTitle: {fontSize: 28, fontWeight: '900', color: '#fff'},
-  screenBody: {fontSize: 14, color: '#fff', marginTop: 6},
+  probeText: {fontSize: 28, fontWeight: '900', color: '#fff'},
 });
 
-exports.title = 'Commit Branching TTRC';
+exports.title = 'Commit Branching jank';
 exports.category = 'UI';
 exports.description =
-  'enableFabricCommitBranching delays a new screen’s first content (TTRC) when a ' +
-  'transition keeps the main thread busy. Toggle the flag via RNT_COMMIT_BRANCHING.';
+  'enableFabricCommitBranching: under sustained over-budget frames (BeforeWaiting never ' +
+  'fires) a component update is starved with the flag on, but not off.';
 exports.displayName = 'CommitBranchingExample';
 exports.examples = [
   {
-    title: 'TTRC under a janky transition',
-    name: 'ttrc',
+    title: 'Update starved by jank (BeforeWaiting)',
+    name: 'jank',
     render(): React.Node {
-      return <CommitBranchingTTRC />;
+      return <CommitBranchingJank />;
     },
   },
 ];
