@@ -4,7 +4,7 @@
  * This source code is licensed under the MIT license found in the
  * LICENSE file in the root directory of this source tree.
  *
- * @generated SignedSource<<e010ea1a3e640d4640676263c68a9921>>
+ * @generated SignedSource<<fc839f3a60b136197fdf89c76b54c028>>
  */
 
 /**
@@ -69,6 +69,7 @@ class ReactNativeFeatureFlagsAccessor {
   bool enableLayoutAnimationsOnAndroid();
   bool enableLayoutAnimationsOnIOS();
   bool enableModuleArgumentNSNullConversionIOS();
+  bool enableMountingCoordinatorPullModelAndroid();
   bool enableMutationObserverByDefault();
   bool enableNativeCSSParsing();
   bool enableNetworkEventReporting();
@@ -129,7 +130,7 @@ class ReactNativeFeatureFlagsAccessor {
   std::unique_ptr<ReactNativeFeatureFlagsProvider> currentProvider_;
   bool wasOverridden_;
 
-  std::array<std::atomic<const char*>, 86> accessedFeatureFlags_;
+  std::array<std::atomic<const char*>, 87> accessedFeatureFlags_;
 
   std::atomic<std::optional<bool>> commonTestFlag_;
   std::atomic<std::optional<bool>> cdpInteractionMetricsEnabled_;
@@ -168,6 +169,7 @@ class ReactNativeFeatureFlagsAccessor {
   std::atomic<std::optional<bool>> enableLayoutAnimationsOnAndroid_;
   std::atomic<std::optional<bool>> enableLayoutAnimationsOnIOS_;
   std::atomic<std::optional<bool>> enableModuleArgumentNSNullConversionIOS_;
+  std::atomic<std::optional<bool>> enableMountingCoordinatorPullModelAndroid_;
   std::atomic<std::optional<bool>> enableMutationObserverByDefault_;
   std::atomic<std::optional<bool>> enableNativeCSSParsing_;
   std::atomic<std::optional<bool>> enableNetworkEventReporting_;

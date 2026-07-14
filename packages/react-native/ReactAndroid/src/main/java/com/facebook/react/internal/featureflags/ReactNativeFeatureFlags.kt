@@ -4,7 +4,7 @@
  * This source code is licensed under the MIT license found in the
  * LICENSE file in the root directory of this source tree.
  *
- * @generated SignedSource<<c9e8eeefc709e1246577d67155300906>>
+ * @generated SignedSource<<975d2b967d948656a0901852b6f5f014>>
  */
 
 /**
@@ -251,6 +251,12 @@ public object ReactNativeFeatureFlags {
    */
   @JvmStatic
   public fun enableModuleArgumentNSNullConversionIOS(): Boolean = accessor.enableModuleArgumentNSNullConversionIOS()
+
+  /**
+   * When enabled, Android mounts transactions with the pull model (like iOS): the commit thread no longer pulls and builds the mount batch in schedulerShouldRenderTransactions. Instead the UI thread pulls the transaction itself via a lightweight PullTransactionMountItem enqueued in the MountItemDispatcher, builds the IntBufferBatchMountItem, and applies it synchronously. Implies rawProps accumulation (enableAccumulatedUpdatesInRawPropsAndroid behavior): a pull may collapse several commits into one diff, which requires complete rawProps.
+   */
+  @JvmStatic
+  public fun enableMountingCoordinatorPullModelAndroid(): Boolean = accessor.enableMountingCoordinatorPullModelAndroid()
 
   /**
    * Enables the MutationObserver Web API in React Native.

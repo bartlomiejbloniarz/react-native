@@ -443,6 +443,17 @@ const definitions: FeatureFlagDefinitions = {
       },
       ossReleaseStage: 'none',
     },
+    enableMountingCoordinatorPullModelAndroid: {
+      defaultValue: false,
+      metadata: {
+        dateAdded: '2026-07-14',
+        description:
+          'When enabled, Android mounts transactions with the pull model (like iOS): the commit thread no longer pulls and builds the mount batch in schedulerShouldRenderTransactions. Instead the UI thread pulls the transaction itself via a lightweight PullTransactionMountItem enqueued in the MountItemDispatcher, builds the IntBufferBatchMountItem, and applies it synchronously. Implies rawProps accumulation (enableAccumulatedUpdatesInRawPropsAndroid behavior): a pull may collapse several commits into one diff, which requires complete rawProps.',
+        expectedReleaseValue: true,
+        purpose: 'experimentation',
+      },
+      ossReleaseStage: 'none',
+    },
     enableMutationObserverByDefault: {
       defaultValue: false,
       metadata: {

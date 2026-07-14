@@ -4,7 +4,7 @@
  * This source code is licensed under the MIT license found in the
  * LICENSE file in the root directory of this source tree.
  *
- * @generated SignedSource<<5ae6b1a0bfa9d680aa61685dbacd69d2>>
+ * @generated SignedSource<<9286e328983aa7bd8634ffec282442a4>>
  */
 
 /**
@@ -57,6 +57,7 @@ internal class ReactNativeFeatureFlagsCxxAccessor : ReactNativeFeatureFlagsAcces
   private var enableLayoutAnimationsOnAndroidCache: Boolean? = null
   private var enableLayoutAnimationsOnIOSCache: Boolean? = null
   private var enableModuleArgumentNSNullConversionIOSCache: Boolean? = null
+  private var enableMountingCoordinatorPullModelAndroidCache: Boolean? = null
   private var enableMutationObserverByDefaultCache: Boolean? = null
   private var enableNativeCSSParsingCache: Boolean? = null
   private var enableNetworkEventReportingCache: Boolean? = null
@@ -436,6 +437,15 @@ internal class ReactNativeFeatureFlagsCxxAccessor : ReactNativeFeatureFlagsAcces
     if (cached == null) {
       cached = ReactNativeFeatureFlagsCxxInterop.enableModuleArgumentNSNullConversionIOS()
       enableModuleArgumentNSNullConversionIOSCache = cached
+    }
+    return cached
+  }
+
+  override fun enableMountingCoordinatorPullModelAndroid(): Boolean {
+    var cached = enableMountingCoordinatorPullModelAndroidCache
+    if (cached == null) {
+      cached = ReactNativeFeatureFlagsCxxInterop.enableMountingCoordinatorPullModelAndroid()
+      enableMountingCoordinatorPullModelAndroidCache = cached
     }
     return cached
   }
