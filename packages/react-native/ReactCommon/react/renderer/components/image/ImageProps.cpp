@@ -25,10 +25,14 @@ ImageProps::ImageProps(
           "defaultSource",
           sourceProps.defaultSource,
           {})),
+      // The wire name of this prop is "loadingIndicatorSrc"
+      // (ImageViewNativeComponent.js / the Android @ReactProp setter);
+      // "loadingIndicatorSource" is only the JS-facing <Image> prop that
+      // Image.android.js translates.
       loadingIndicatorSource(convertRawProp(
           context,
           rawProps,
-          "loadingIndicatorSource",
+          "loadingIndicatorSrc",
           sourceProps.loadingIndicatorSource,
           {})),
       resizeMode(convertRawProp(
@@ -113,7 +117,7 @@ void ImageProps::setProp(
   switch (hash) {
     RAW_SET_PROP_SWITCH_CASE(sources, "source");
     RAW_SET_PROP_SWITCH_CASE(defaultSource, "defaultSource");
-    RAW_SET_PROP_SWITCH_CASE(loadingIndicatorSource, "loadingIndicatorSource");
+    RAW_SET_PROP_SWITCH_CASE(loadingIndicatorSource, "loadingIndicatorSrc");
     RAW_SET_PROP_SWITCH_CASE_BASIC(resizeMode);
     RAW_SET_PROP_SWITCH_CASE_BASIC(blurRadius);
     RAW_SET_PROP_SWITCH_CASE_BASIC(capInsets);
@@ -165,7 +169,7 @@ folly::dynamic ImageProps::getDiffProps(const Props* prevProps) const {
   }
 
   if (loadingIndicatorSource != oldProps->loadingIndicatorSource) {
-    result["loadingIndicatorSource"] = toDynamic(loadingIndicatorSource);
+    result["loadingIndicatorSrc"] = toDynamic(loadingIndicatorSource);
   }
 
   if (resizeMode != oldProps->resizeMode) {
