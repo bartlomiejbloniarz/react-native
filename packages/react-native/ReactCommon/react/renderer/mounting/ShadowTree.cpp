@@ -41,7 +41,9 @@ std::string getShadowTreeCommitSourceName(ShadowTreeCommitSource source) {
 
 inline bool isPropsUpdatesAccumulationGuaranteed() {
 #ifdef __ANDROID__
-  return ReactNativeFeatureFlags::enableAccumulatedUpdatesInRawPropsAndroid();
+  // The pull model implies rawProps accumulation (see Props.cpp).
+  return ReactNativeFeatureFlags::enableAccumulatedUpdatesInRawPropsAndroid() ||
+      ReactNativeFeatureFlags::enableMountingCoordinatorPullModelAndroid();
 #else
   return true;
 #endif

@@ -133,6 +133,10 @@ class FabricUIManagerBinding : public jni::HybridClass<FabricUIManagerBinding>,
 
   void reportMount(SurfaceId surfaceId);
 
+  // Pull model: called on the UI thread from a PullTransactionMountItem. Pulls
+  // the surface's pending transaction and applies it synchronously.
+  void pullAndExecuteTransaction(SurfaceId surfaceId);
+
   jint findNextFocusableElement(jint parentTag, jint focusedTag, jint direction);
 
   jintArray getRelativeAncestorList(jint rootTag, jint childTag);

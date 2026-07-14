@@ -120,6 +120,58 @@ void FabricUIManagerBinding::reportMount(SurfaceId surfaceId) {
   scheduler->reportMount(surfaceId);
 }
 
+void FabricUIManagerBinding::pullAndExecuteTransaction(SurfaceId surfaceId) {
+  TraceSection section("FabricUIManagerBinding::pullAndExecuteTransaction");
+
+  // Resolve the surface's MountingCoordinator (same lookup as `reportMount`).
+  // If the surface has been stopped, it is no longer in the registry and we
+  // simply drop this notification — this is how pending notifications for dead
+  // surfaces get cleared.
+  std::shared_ptr<const MountingCoordinator> mountingCoordinator;
+  {
+    std::shared_lock lock(surfaceHandlerRegistryMutex_);
+    auto iterator = surfaceHandlerRegistry_.find(surfaceId);
+    if (iterator == surfaceHandlerRegistry_.end()) {
+      return;
+    }
+    const auto* surfaceHandler = std::get_if<SurfaceHandler>(&iterator->second);
+    jni::local_ref<SurfaceHandlerBinding::jhybridobject> javaSurfaceHandler;
+    if (surfaceHandler == nullptr) {
+      javaSurfaceHandler =
+          std::get<jni::weak_ref<SurfaceHandlerBinding::jhybridobject>>(
+              iterator->second)
+              .lockLocal();
+      if (javaSurfaceHandler) {
+        surfaceHandler = &javaSurfaceHandler->cthis()->getSurfaceHandler();
+      }
+    }
+    if (surfaceHandler != nullptr) {
+      mountingCoordinator = surfaceHandler->getMountingCoordinator();
+    }
+  }
+
+  if (mountingCoordinator == nullptr) {
+    return;
+  }
+
+  auto mountingManager = getMountingManager("pullAndExecuteTransaction");
+  if (!mountingManager) {
+    return;
+  }
+
+  // The UI thread pulls the transaction itself (it may accumulate several
+  // revisions committed since the notification was enqueued, and may be empty
+  // if a previous pull already consumed them). willPerformAsynchronously =
+  // false: the transaction is applied synchronously right here, so no
+  // `didPerformAsyncTransactions` bookkeeping is needed.
+  auto mountingTransaction =
+      mountingCoordinator->pullTransaction(/* willPerformAsynchronously = */
+                                           false);
+  if (mountingTransaction.has_value()) {
+    mountingManager->executeMount(*mountingTransaction, /* synchronous = */ true);
+  }
+}
+
 #pragma mark - Surface management
 
 // Used by bridgeless
@@ -628,9 +680,11 @@ FabricUIManagerBinding::getMountingManager(const char* locationHint) {
 
 void FabricUIManagerBinding::schedulerDidFinishTransaction(
     const std::shared_ptr<const MountingCoordinator>& mountingCoordinator) {
-  if (ReactNativeFeatureFlags::enableAccumulatedUpdatesInRawPropsAndroid()) {
-    // We don't do anything here. We will pull the transaction in
-    // `schedulerShouldRenderTransactions`.
+  if (ReactNativeFeatureFlags::enableMountingCoordinatorPullModelAndroid() ||
+      ReactNativeFeatureFlags::enableAccumulatedUpdatesInRawPropsAndroid()) {
+    // We don't do anything here. With the pull model, the UI thread pulls the
+    // transaction itself (see `pullAndExecuteTransaction`); otherwise we will
+    // pull the transaction in `schedulerShouldRenderTransactions`.
   } else {
     // We shouldn't be pulling the transaction here (which triggers diffing of
     // the trees to determine the mutations to run on the host platform),
@@ -678,7 +732,13 @@ void FabricUIManagerBinding::schedulerShouldRenderTransactions(
     }
   }
 
-  if (ReactNativeFeatureFlags::enableAccumulatedUpdatesInRawPropsAndroid()) {
+  if (ReactNativeFeatureFlags::enableMountingCoordinatorPullModelAndroid()) {
+    // Pull model: do NOT pull the transaction or build the batch here (on the
+    // commit thread). Just notify Java that a transaction is available; the UI
+    // thread will pull it via a PullTransactionMountItem and call back into
+    // `pullAndExecuteTransaction`.
+    mountingManager->onTransactionAvailable(mountingCoordinator->getSurfaceId());
+  } else if (ReactNativeFeatureFlags::enableAccumulatedUpdatesInRawPropsAndroid()) {
     auto mountingTransaction = mountingCoordinator->pullTransaction(
         /* willPerformAsynchronously = */ true);
     if (mountingTransaction.has_value()) {
@@ -867,6 +927,9 @@ void FabricUIManagerBinding::registerNatives() {
           "drainPreallocateViewsQueue",
           FabricUIManagerBinding::drainPreallocateViewsQueue),
       makeNativeMethod("reportMount", FabricUIManagerBinding::reportMount),
+      makeNativeMethod(
+          "pullAndExecuteTransaction",
+          FabricUIManagerBinding::pullAndExecuteTransaction),
       makeNativeMethod(
           "uninstallFabricUIManager",
           FabricUIManagerBinding::uninstallFabricUIManager),
