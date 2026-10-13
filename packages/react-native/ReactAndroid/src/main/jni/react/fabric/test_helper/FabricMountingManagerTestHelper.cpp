@@ -92,6 +92,16 @@ class FabricMountingManagerTestHelper::FrameAnimator
   mutable std::optional<ShadowViewMutation> frame;
 };
 
+// Runs the JS tasks of the animation backend on the calling thread.
+class FabricMountingManagerTestHelper::ImmediateJSInvoker : public CallInvoker {
+ public:
+  void invokeAsync(CallFunc&& /*func*/) noexcept override {}
+  void invokeAsync(std::function<void()>&& func) noexcept override {
+    func();
+  }
+  void invokeSync(CallFunc&& /*func*/) override {}
+};
+
 namespace {
 
 ShadowView makeShadowView(jint surfaceId, jint tag) {
@@ -436,6 +446,34 @@ std::shared_ptr<UIManager> FabricMountingManagerTestHelper::getUIManager() {
   return javaUIManager_->getBinding()->getScheduler()->getUIManager();
 }
 
+void FabricMountingManagerTestHelper::commitViewProps(
+    jint surfaceId,
+    jint tag,
+    jni::alias_ref<NativeMap::javaobject> props,
+    jboolean mountSynchronously) {
+  auto rawProps = props->cthis()->consume();
+  const auto& family = views_.at(tag)->getFamily();
+  getUIManager()->getShadowTreeRegistry().visit(
+      surfaceId, [&](const ShadowTree& shadowTree) {
+        shadowTree.commit(
+            [&](const RootShadowNode& oldRootShadowNode) {
+              return std::static_pointer_cast<RootShadowNode>(
+                  oldRootShadowNode.cloneTree(
+                      family, [&](const ShadowNode& oldShadowNode) {
+                        PropsParserContext context{
+                            surfaceId, *oldShadowNode.getContextContainer()};
+                        return oldShadowNode.clone(
+                            {.props = oldShadowNode.getComponentDescriptor()
+                                          .cloneProps(
+                                              context,
+                                              oldShadowNode.getProps(),
+                                              RawProps(rawProps))});
+                      }));
+            },
+            {.mountSynchronously = mountSynchronously != 0});
+      });
+}
+
 void FabricMountingManagerTestHelper::createView(
     jint surfaceId,
     jint tag,
@@ -488,6 +526,28 @@ void FabricMountingManagerTestHelper::write(Tag tag, AnimatedProps props) {
                 .props = std::move(props)});
         return mutations;
       });
+}
+
+void FabricMountingManagerTestHelper::own(
+    jint tag,
+    jint propsNodeTag,
+    jni::alias_ref<jni::JArrayClass<jstring>> keys) {
+  std::vector<std::string> ownedKeys;
+  for (size_t i = 0; i < keys->size(); i++) {
+    ownedKeys.push_back(keys->getElement(i)->toStdString());
+  }
+  auto animationBackend = getUIManager()->unstable_getAnimationBackend().lock();
+  animationBackend->registerJSInvoker(std::make_shared<ImmediateJSInvoker>());
+  animationBackend->own(
+      views_.at(tag)->getFamilyShared(), propsNodeTag, ownedKeys);
+}
+
+void FabricMountingManagerTestHelper::release(jint propsNodeTag) {
+  auto animationBackend = getUIManager()->unstable_getAnimationBackend().lock();
+  animationBackend->release(propsNodeTag);
+  // Releases are committed after the frame of the operation.
+  animationBackend->pushAnimationMutations(
+      [](AnimationTimestamp /*timestamp*/) { return AnimationMutations{}; });
 }
 
 void FabricMountingManagerTestHelper::requestPreallocation(jint tag) {
@@ -607,11 +667,15 @@ void FabricMountingManagerTestHelper::registerNatives() {
       makeNativeMethod(
           "commitViews", FabricMountingManagerTestHelper::commitViews),
       makeNativeMethod(
+          "commitViewProps", FabricMountingManagerTestHelper::commitViewProps),
+      makeNativeMethod(
           "createView", FabricMountingManagerTestHelper::createView),
       makeNativeMethod(
           "writeProps", FabricMountingManagerTestHelper::writeProps),
       makeNativeMethod(
           "writeTypedProps", FabricMountingManagerTestHelper::writeTypedProps),
+      makeNativeMethod("own", FabricMountingManagerTestHelper::own),
+      makeNativeMethod("release", FabricMountingManagerTestHelper::release),
       makeNativeMethod(
           "requestPreallocation",
           FabricMountingManagerTestHelper::requestPreallocation),

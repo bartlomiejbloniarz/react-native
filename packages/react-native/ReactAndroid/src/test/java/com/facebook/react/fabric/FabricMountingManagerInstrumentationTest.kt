@@ -532,6 +532,8 @@ class FabricMountingManagerInstrumentationTest {
 
           override fun useSharedAnimatedBackend(): Boolean = sharedAnimatedBackend
 
+          override fun cxxNativeAnimatedEnabled(): Boolean = sharedAnimatedBackend
+
           override fun disableViewPreallocationAndroid(): Boolean = !viewPreallocation
         }
     ReactNativeFeatureFlags.dangerouslyForceOverride(flags)
@@ -843,5 +845,63 @@ class FabricMountingManagerInstrumentationTest {
       alphas[1] = fabricUIManager.resolveView(43)!!.alpha
     }
     assertThat(alphas).containsExactly(0.5f, 0.25f)
+  }
+
+  /**
+   * An owned prop keeps its animated value over React commits until it is released, when React's
+   * value is mounted again.
+   */
+  @Test
+  fun native_aReleaseMountsReactsValue() {
+    overrideBackendFlags(accumulatedRawProps = false, sharedAnimatedBackend = true)
+    val fabricUIManager = createFabricUIManager()
+    val helper = registerBinding(fabricUIManager)
+    val surfaceId = startSurfaceWithViews(fabricUIManager, helper, intArrayOf())
+    helper.createView(surfaceId, 42, props("opacity" to 0.2))
+    thread { helper.commitReactViews(surfaceId, intArrayOf(42)) }.join()
+    dispatchMountItems(fabricUIManager)
+    helper.own(42, 100, arrayOf("opacity"))
+    val alphas = mutableListOf<Float>()
+    fun readAlpha() {
+      dispatchMountItems(fabricUIManager)
+      runOnUiThread { alphas.add(fabricUIManager.resolveView(42)!!.alpha) }
+    }
+
+    runOnUiThread { helper.writeProps(42, props("opacity" to 0.6)) }
+    readAlpha()
+    runOnUiThread {
+      helper.commitViewProps(surfaceId, 42, props("nativeID" to "react"), true)
+    }
+    readAlpha()
+    runOnUiThread {
+      helper.release(100)
+      // Renders the release commit, as the end of the JS task would.
+      helper.commitViewProps(surfaceId, 42, props("nativeID" to "rendered"), true)
+    }
+    readAlpha()
+
+    assertThat(alphas).containsExactly(0.6f, 0.6f, 0.2f)
+  }
+
+  @Test
+  fun native_aReleaseAfterAnOwnedBatchWasSerializedMountsReactsValue() {
+    overrideBackendFlags(accumulatedRawProps = false, sharedAnimatedBackend = true)
+    val fabricUIManager = createFabricUIManager()
+    val helper = registerBinding(fabricUIManager)
+    val surfaceId = startSurfaceWithViews(fabricUIManager, helper, intArrayOf())
+    helper.createView(surfaceId, 42, props("opacity" to 0.2))
+    thread { helper.commitReactViews(surfaceId, intArrayOf(42)) }.join()
+    dispatchMountItems(fabricUIManager)
+    helper.own(42, 100, arrayOf("opacity"))
+    runOnUiThread { helper.writeProps(42, props("opacity" to 0.6)) }
+
+    thread { helper.commitViewProps(surfaceId, 42, props("opacity" to 0.3), false) }.join()
+    runOnUiThread {
+      helper.release(100)
+      helper.commitViewProps(surfaceId, 42, props("nativeID" to "rendered"), true)
+    }
+    dispatchMountItems(fabricUIManager)
+
+    runOnUiThread { assertThat(fabricUIManager.resolveView(42)!!.alpha).isEqualTo(0.3f) }
   }
 }

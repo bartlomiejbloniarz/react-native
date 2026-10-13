@@ -6,16 +6,22 @@
  */
 
 #include <gtest/gtest.h>
+#include <react/featureflags/ReactNativeFeatureFlags.h>
+#include <react/featureflags/ReactNativeFeatureFlagsDefaults.h>
+#include <react/renderer/animated/NativeAnimatedNodesManager.h>
 #include <react/renderer/animationbackend/AnimatedPropsBuilder.h>
 #include <react/renderer/animationbackend/AnimatedPropsSerializer.h>
 #include <react/renderer/animationbackend/AnimationBackend.h>
 #include <react/renderer/components/root/RootShadowNode.h>
+#include <react/renderer/components/scrollview/ScrollViewShadowNode.h>
+#include <react/renderer/components/text/ParagraphShadowNode.h>
 #include <react/renderer/components/view/ViewShadowNode.h>
 #include <react/renderer/element/ComponentBuilder.h>
 #include <react/renderer/element/Element.h>
 #include <react/renderer/element/testUtils.h>
 #include <react/renderer/graphics/Color.h>
 #include <react/renderer/uimanager/UIManager.h>
+#include <react/renderer/uimanager/UIManagerCommitHook.h>
 #include <react/renderer/uimanager/UIManagerDelegate.h>
 #include <react/utils/ContextContainer.h>
 #include <array>
@@ -84,13 +90,47 @@ class RecordingUIManagerDelegate : public UIManagerDelegate {
   void uiManagerDidClearPendingSnapshots() override {}
 };
 
-class ImmediateCallInvoker : public CallInvoker {
+// Runs JS tasks immediately, or queues them while deferring.
+class TestCallInvoker : public CallInvoker {
  public:
+  bool defers{false};
+
   void invokeAsync(CallFunc&& /*func*/) noexcept override {}
   void invokeAsync(std::function<void()>&& func) noexcept override {
-    func();
+    if (defers) {
+      tasks_.push_back(std::move(func));
+    } else {
+      func();
+    }
   }
   void invokeSync(CallFunc&& /*func*/) override {}
+
+  void runDeferredTasks() {
+    defers = false;
+    runQueuedTasks();
+  }
+
+  size_t queuedTaskCount() const {
+    return tasks_.size();
+  }
+
+  // Runs the queued tasks; the tasks they queue stay queued while deferring.
+  void runQueuedTasks() {
+    for (auto& task : std::exchange(tasks_, {})) {
+      task();
+    }
+  }
+
+ private:
+  std::vector<std::function<void()>> tasks_;
+};
+
+// Pulls cover every revision committed since the last one on Android too.
+class AccumulatedPropsFlags : public ReactNativeFeatureFlagsDefaults {
+ public:
+  bool enableAccumulatedUpdatesInRawPropsAndroid() override {
+    return true;
+  }
 };
 
 constexpr SurfaceId kSurface = 1;
@@ -180,15 +220,23 @@ class AnimationBackendSurfaceTest : public ::testing::Test {
   std::shared_ptr<ViewShadowNode> view;
   ShadowTree* shadowTree{nullptr};
   std::shared_ptr<AnimationBackend> backend;
+  std::shared_ptr<TestCallInvoker> jsInvoker =
+      std::make_shared<TestCallInvoker>();
 
-  void SetUp() override {
-    uiManager->setDelegate(&delegate);
+  // The root's child, which shows `view`.
+  virtual std::shared_ptr<const ShadowNode> buildRootChild() {
     view = builder.build(
         Element<ViewShadowNode>().tag(kView).surfaceId(kSurface).props([] {
           auto props = std::make_shared<ViewProps>();
           props->opacity = 0.8;
           return props;
         }));
+    return view;
+  }
+
+  void SetUp() override {
+    uiManager->setDelegate(&delegate);
+    auto rootChild = buildRootChild();
     auto tree = std::make_unique<ShadowTree>(
         kSurface,
         LayoutConstraints{},
@@ -202,7 +250,8 @@ class AnimationBackendSurfaceTest : public ::testing::Test {
               oldRootShadowNode.ShadowNode::clone(
                   {.children = std::make_shared<
                        std::vector<std::shared_ptr<const ShadowNode>>>(
-                       std::vector<std::shared_ptr<const ShadowNode>>{view})}));
+                       std::vector<std::shared_ptr<const ShadowNode>>{
+                           rootChild})}));
         },
         {});
     uiManager->startSurface(
@@ -210,13 +259,14 @@ class AnimationBackendSurfaceTest : public ::testing::Test {
     pull();
     backend = std::make_shared<AnimationBackend>(
         std::make_shared<TestAnimationChoreographer>(), uiManager);
-    backend->registerJSInvoker(std::make_shared<ImmediateCallInvoker>());
+    backend->registerJSInvoker(jsInvoker);
   }
 
   void TearDown() override {
     backend.reset();
     uiManager->stopSurface(kSurface);
     uiManager->setDelegate(nullptr);
+    ReactNativeFeatureFlags::dangerouslyReset();
   }
 
   void write(AnimationMutations mutations) {
@@ -278,11 +328,78 @@ class AnimationBackendSurfaceTest : public ::testing::Test {
     commit(rawProps, ShadowTreeCommitSource::React);
   }
 
+  void commitRootChildren(
+      const std::vector<std::shared_ptr<const ShadowNode>>& children) {
+    shadowTree->commit(
+        [&](const RootShadowNode& oldRootShadowNode) {
+          return std::static_pointer_cast<RootShadowNode>(
+              oldRootShadowNode.ShadowNode::clone(
+                  {.children = std::make_shared<
+                       std::vector<std::shared_ptr<const ShadowNode>>>(
+                       children)}));
+        },
+        {.source = ShadowTreeCommitSource::React});
+  }
+
+  // Writes the final values of animations that finished, to be committed by
+  // an end sync.
+  void writeFinished(const folly::dynamic& rawProps) {
+    AnimationMutations mutations;
+    std::unordered_set<std::string> finishedKeys;
+    for (const auto& [key, _] : rawProps.items()) {
+      finishedKeys.insert(key.getString());
+    }
+    mutations.batch.push_back(
+        AnimationMutation{
+            .tag = kView,
+            .family = view->getFamilyShared(),
+            .props =
+                {.props = {}, .rawProps = std::make_unique<RawProps>(rawProps)},
+            .finishedKeys = std::move(finishedKeys)});
+    mutations.asyncFlushSurfaces.insert(kSurface);
+    write(std::move(mutations));
+  }
+
+  static void accumulatePropsUpdates() {
+    ReactNativeFeatureFlags::dangerouslyReset();
+    ReactNativeFeatureFlags::override(
+        std::make_unique<AccumulatedPropsFlags>());
+  }
+
+  // The view's opacity once the transaction is mounted.
+  float mountedOpacity(const MountingTransaction& transaction) const {
+    auto props = updatedProps(transaction);
+    EXPECT_NE(props, nullptr);
+    auto opacity = static_cast<const ViewProps&>(*props).opacity;
+#ifdef ANDROID
+    // Android judges direct writes when it executes mount batches.
+    const auto& telemetry = transaction.getTelemetry();
+    auto newer = backend
+                     ->newerDirectWrites(
+                         kSurface,
+                         {{ kView,
+                            telemetry.getAnimationStampNumber(),
+                            telemetry.getReleaseCoverage() }})
+                     .at(0);
+    if (newer.count("opacity") != 0) {
+      opacity = static_cast<Float>(newer["opacity"].asDouble());
+    }
+#endif
+    return opacity;
+  }
+
+  // Releases the node in a frame, like a C++ Animated operation.
+  void release(Tag propsNodeTag) {
+    backend->release(propsNodeTag);
+    write(AnimationMutations{});
+  }
+
   const ViewProps& treeProps() const {
-    return static_cast<const ViewProps&>(*shadowTree->getCurrentRevision()
-                                              .rootShadowNode->getChildren()
-                                              .at(0)
-                                              ->getProps());
+    const auto& root = *shadowTree->getCurrentRevision().rootShadowNode;
+    auto ancestors = view->getFamily().getAncestors(root);
+    const auto& [parent, index] = ancestors.back();
+    return static_cast<const ViewProps&>(
+        *parent.get().getChildren().at(index)->getProps());
   }
 
   MountingTransaction pull() const {
@@ -777,6 +894,1004 @@ TEST_F(
   ASSERT_TRUE(transaction.has_value());
   EXPECT_EQ(transaction->getTelemetry().getAnimationStampNumber(), 1u);
   EXPECT_EQ(transaction->getAnimationStamps().back().number, 1u);
+}
+
+constexpr Tag kPropsNode = 100;
+
+TEST_F(AnimationBackendSurfaceTest, ownedWritesStayOutOfReactCommits) {
+  backend->own(view->getFamilyShared(), kPropsNode, {"opacity"});
+  write(folly::dynamic::object("opacity", 0.5));
+
+  reactCommit(folly::dynamic::object("nativeID", "a"));
+
+  EXPECT_EQ(treeProps().opacity, 0.8f);
+  auto transaction = pull();
+  const auto& telemetry = transaction.getTelemetry();
+  EXPECT_EQ(
+      backend->newerDirectWrites(
+          kSurface,
+          {{kView,
+            telemetry.getAnimationStampNumber(),
+            telemetry.getReleaseCoverage()}}),
+      std::vector<folly::dynamic>{folly::dynamic::object("opacity", 0.5)});
+#ifndef ANDROID
+  auto props = updatedProps(transaction);
+  ASSERT_NE(props, nullptr);
+  EXPECT_EQ(static_cast<const ViewProps&>(*props).opacity, 0.5f);
+#endif
+}
+
+TEST_F(AnimationBackendSurfaceTest, ownedPropsStayOutOfLayoutCommits) {
+  backend->own(view->getFamilyShared(), kPropsNode, {"opacity"});
+
+  write(folly::dynamic::object("opacity", 0.5)("width", 50), true);
+
+  EXPECT_EQ(treeProps().opacity, 0.8f);
+  EXPECT_EQ(
+      treeProps().yogaStyle.dimension(yoga::Dimension::Width),
+      yoga::StyleSizeLength::points(50));
+}
+
+TEST_F(AnimationBackendSurfaceTest, aReleaseMountsReactsValue) {
+  backend->own(view->getFamilyShared(), kPropsNode, {"opacity"});
+  write(folly::dynamic::object("opacity", 0.5));
+  reactCommit(folly::dynamic::object("nativeID", "a"));
+  pull();
+
+  release(kPropsNode);
+
+  auto transaction = pull();
+  const auto& telemetry = transaction.getTelemetry();
+  auto releaseCoverage = telemetry.getReleaseCoverage();
+  EXPECT_GT(releaseCoverage, 0u);
+  auto props = updatedProps(transaction);
+  ASSERT_NE(props, nullptr);
+  EXPECT_EQ(static_cast<const ViewProps&>(*props).opacity, 0.8f);
+  auto stamp = telemetry.getAnimationStampNumber();
+  EXPECT_EQ(
+      backend->newerDirectWrites(kSurface, {{kView, stamp, releaseCoverage}}),
+      std::vector<folly::dynamic>{folly::dynamic::object()});
+  EXPECT_EQ(
+      backend->newerDirectWrites(
+          kSurface, {{kView, stamp, releaseCoverage - 1}}),
+      std::vector<folly::dynamic>{folly::dynamic::object("opacity", 0.5)});
+#ifdef RN_SERIALIZABLE_STATE
+  auto releasedValues =
+      backend->releasedValues(kSurface, kView, 0, releaseCoverage, props);
+  EXPECT_NEAR(releasedValues["opacity"].asDouble(), 0.8, 0.0001);
+#endif
+}
+
+TEST_F(AnimationBackendSurfaceTest, aReleasedViewWithoutAnUpdateIsUpdated) {
+  backend->own(view->getFamilyShared(), kPropsNode, {"opacity"});
+  write(folly::dynamic::object("opacity", 0.5));
+  reactCommit(folly::dynamic::object("nativeID", "a"));
+  pull();
+  auto mountedRoot = shadowTree->getCurrentRevision().rootShadowNode;
+  release(kPropsNode);
+
+  shadowTree->commit(
+      [&](const RootShadowNode& /*oldRootShadowNode*/) {
+        return std::static_pointer_cast<RootShadowNode>(
+            mountedRoot->ShadowNode::clone({}));
+      },
+      {});
+
+  auto transaction = pull();
+  auto props = updatedProps(transaction);
+  ASSERT_NE(props, nullptr);
+  EXPECT_NE(props, mountedRoot->getChildren().at(0)->getProps());
+  EXPECT_EQ(static_cast<const ViewProps&>(*props).opacity, 0.8f);
+}
+
+TEST_F(AnimationBackendSurfaceTest, aFinishedOwnedValueReachesTheTree) {
+  backend->own(view->getFamilyShared(), kPropsNode, {"opacity"});
+
+  writeFinished(folly::dynamic::object("opacity", 0.3));
+
+  EXPECT_EQ(treeProps().opacity, 0.3f);
+}
+
+TEST_F(AnimationBackendSurfaceTest, aReleaseKeepsKeysANewerNodeOwns) {
+  backend->own(view->getFamilyShared(), kPropsNode, {"opacity"});
+  backend->own(view->getFamilyShared(), kPropsNode + 1, {"opacity"});
+  write(folly::dynamic::object("opacity", 0.5));
+
+  release(kPropsNode);
+
+  reactCommit(folly::dynamic::object("nativeID", "a"));
+  auto transaction = pull();
+  EXPECT_EQ(transaction.getTelemetry().getReleaseCoverage(), 0u);
+  const auto& telemetry = transaction.getTelemetry();
+  EXPECT_EQ(
+      backend->newerDirectWrites(
+          kSurface,
+          {{kView,
+            telemetry.getAnimationStampNumber(),
+            telemetry.getReleaseCoverage()}}),
+      std::vector<folly::dynamic>{folly::dynamic::object("opacity", 0.5)});
+}
+
+TEST_F(AnimationBackendSurfaceTest, aLayoutUpdateOfAReleasedViewAppliesProps) {
+  accumulatePropsUpdates();
+  backend->own(view->getFamilyShared(), kPropsNode, {"opacity"});
+  write(folly::dynamic::object("opacity", 0.5));
+  reactCommit(folly::dynamic::object("nativeID", "a"));
+  pull();
+  auto mountedRoot = shadowTree->getCurrentRevision().rootShadowNode;
+  release(kPropsNode);
+
+  shadowTree->commit(
+      [&](const RootShadowNode& /*oldRootShadowNode*/) {
+        return mountedRoot->clone(
+            PropsParserContext{kSurface, *contextContainer},
+            LayoutConstraints{.minimumSize = {50, 50}, .maximumSize = {50, 50}},
+            LayoutContext{});
+      },
+      {});
+
+  auto transaction = pull();
+  const ShadowViewMutation* update = nullptr;
+  for (const auto& mutation : transaction.getMutations()) {
+    if (mutation.type == ShadowViewMutation::Update &&
+        mutation.newChildShadowView.tag == kView) {
+      update = &mutation;
+    }
+  }
+  ASSERT_NE(update, nullptr);
+  EXPECT_NE(
+      update->oldChildShadowView.layoutMetrics,
+      update->newChildShadowView.layoutMetrics);
+  EXPECT_NE(update->newChildShadowView.props, update->oldChildShadowView.props);
+  EXPECT_EQ(
+      static_cast<const ViewProps&>(*update->newChildShadowView.props).opacity,
+      0.8f);
+}
+
+TEST_F(AnimationBackendSurfaceTest, aPullAfterAReleaseAndLaterCommitsMountsIt) {
+  accumulatePropsUpdates();
+  backend->own(view->getFamilyShared(), kPropsNode, {"opacity"});
+  write(folly::dynamic::object("opacity", 0.5));
+  reactCommit(folly::dynamic::object("nativeID", "a"));
+  pull();
+  release(kPropsNode);
+  reactCommit(folly::dynamic::object("nativeID", "b"));
+  reactCommit(folly::dynamic::object("nativeID", "c"));
+
+  auto transaction = pull();
+
+  const auto& telemetry = transaction.getTelemetry();
+  EXPECT_GT(telemetry.getReleaseCoverage(), 0u);
+  auto props = updatedProps(transaction);
+  ASSERT_NE(props, nullptr);
+  EXPECT_EQ(props->nativeId, "c");
+  EXPECT_EQ(static_cast<const ViewProps&>(*props).opacity, 0.8f);
+  EXPECT_EQ(
+      backend->newerDirectWrites(
+          kSurface,
+          {{kView,
+            telemetry.getAnimationStampNumber(),
+            telemetry.getReleaseCoverage()}}),
+      std::vector<folly::dynamic>{folly::dynamic::object()});
+}
+
+TEST_F(AnimationBackendSurfaceTest, aReconnectionBeforeTheReleaseKeepsOwning) {
+  backend->own(view->getFamilyShared(), kPropsNode, {"opacity"});
+  write(folly::dynamic::object("opacity", 0.5));
+  jsInvoker->defers = true;
+  backend->release(kPropsNode);
+  backend->own(view->getFamilyShared(), kPropsNode, {"opacity"});
+  write(folly::dynamic::object("opacity", 0.7));
+
+  jsInvoker->runDeferredTasks();
+
+  reactCommit(folly::dynamic::object("nativeID", "a"));
+  auto transaction = pull();
+  const auto& telemetry = transaction.getTelemetry();
+  EXPECT_EQ(
+      backend->newerDirectWrites(
+          kSurface,
+          {{kView,
+            telemetry.getAnimationStampNumber(),
+            telemetry.getReleaseCoverage()}}),
+      std::vector<folly::dynamic>{folly::dynamic::object("opacity", 0.7)});
+}
+
+namespace {
+
+class CommitBranchingFlags : public ReactNativeFeatureFlagsDefaults {
+ public:
+  bool enableFabricCommitBranching() override {
+    return true;
+  }
+};
+
+} // namespace
+
+TEST_F(
+    AnimationBackendSurfaceTest,
+    aMergedReactRevisionFromBeforeAReleaseKeepsTheOwner) {
+  ReactNativeFeatureFlags::dangerouslyReset();
+  ReactNativeFeatureFlags::override(std::make_unique<CommitBranchingFlags>());
+  backend->own(view->getFamilyShared(), kPropsNode, {"opacity"});
+  write(folly::dynamic::object("opacity", 0.5));
+  shadowTree->commit(
+      [&](const RootShadowNode& oldRootShadowNode) {
+        return std::static_pointer_cast<RootShadowNode>(
+            oldRootShadowNode.ShadowNode::clone({}));
+      },
+      {.mountSynchronously = false, .source = ShadowTreeCommitSource::React});
+  shadowTree->promoteReactRevision();
+  release(kPropsNode);
+
+  shadowTree->mergeReactRevision();
+  auto beforeRelease = pull();
+  shadowTree->promoteReactRevision();
+  shadowTree->mergeReactRevision();
+  auto afterRelease = pull();
+
+  auto newerDirectWrites = [&](const MountingTransaction& transaction) {
+    const auto& telemetry = transaction.getTelemetry();
+    return backend
+        ->newerDirectWrites(
+            kSurface,
+            {{kView,
+              telemetry.getAnimationStampNumber(),
+              telemetry.getReleaseCoverage()}})
+        .at(0);
+  };
+  EXPECT_EQ(beforeRelease.getTelemetry().getReleaseCoverage(), 0u);
+  EXPECT_EQ(
+      newerDirectWrites(beforeRelease),
+      folly::dynamic(folly::dynamic::object("opacity", 0.5)));
+  EXPECT_GT(afterRelease.getTelemetry().getReleaseCoverage(), 0u);
+  EXPECT_EQ(
+      newerDirectWrites(afterRelease),
+      folly::dynamic(folly::dynamic::object()));
+}
+
+TEST_F(
+    AnimationBackendSurfaceTest,
+    aReleaseAfterAQueuedEndSyncIsCommittedAfterIt) {
+  backend->own(view->getFamilyShared(), kPropsNode, {"opacity"});
+  backend->own(view->getFamilyShared(), kPropsNode + 1, {"shadowOpacity"});
+  jsInvoker->defers = true;
+  release(kPropsNode + 1);
+  writeFinished(folly::dynamic::object("opacity", 0.5));
+  release(kPropsNode);
+
+  jsInvoker->runDeferredTasks();
+
+  EXPECT_EQ(treeProps().opacity, 0.5f);
+}
+
+namespace {
+
+class EndSyncClearingFlags : public ReactNativeFeatureFlagsDefaults {
+ public:
+  bool updateRuntimeShadowNodeReferencesOnCommitThread() override {
+    return true;
+  }
+};
+
+// Runs a callback in the next end sync commit, after the hooks registered
+// before it.
+class EndSyncHook : public UIManagerCommitHook {
+ public:
+  explicit EndSyncHook(std::function<void()> callback)
+      : callback_(std::move(callback)) {}
+
+  void commitHookWasRegistered(
+      const UIManager& /*uiManager*/) noexcept override {}
+  void commitHookWasUnregistered(
+      const UIManager& /*uiManager*/) noexcept override {}
+
+  RootShadowNode::Unshared shadowTreeWillCommit(
+      const ShadowTree& /*shadowTree*/,
+      const RootShadowNode::Shared& /*oldRootShadowNode*/,
+      const RootShadowNode::Unshared& newRootShadowNode,
+      const ShadowTreeCommitOptions& commitOptions) noexcept override {
+    if (commitOptions.source == ShadowTreeCommitSource::AnimationEndSync &&
+        callback_) {
+      std::exchange(callback_, nullptr)();
+    }
+    return newRootShadowNode;
+  }
+
+ private:
+  std::function<void()> callback_;
+};
+
+} // namespace
+
+TEST_F(AnimationBackendSurfaceTest, anEndSyncKeepsValuesFinishedDuringIt) {
+  ReactNativeFeatureFlags::dangerouslyReset();
+  ReactNativeFeatureFlags::override(std::make_unique<EndSyncClearingFlags>());
+  backend->own(view->getFamilyShared(), kPropsNode, {"opacity"});
+  backend->own(view->getFamilyShared(), kPropsNode + 1, {"shadowOpacity"});
+  EndSyncHook hook([&] {
+    jsInvoker->defers = true;
+    writeFinished(folly::dynamic::object("shadowOpacity", 0.3));
+  });
+  uiManager->registerCommitHook(hook);
+  jsInvoker->defers = true;
+  writeFinished(folly::dynamic::object("opacity", 0.5));
+
+  jsInvoker->runDeferredTasks();
+  jsInvoker->runDeferredTasks();
+
+  uiManager->unregisterCommitHook(hook);
+  EXPECT_EQ(treeProps().opacity, 0.5f);
+  EXPECT_EQ(treeProps().shadowOpacity, 0.3f);
+}
+
+TEST_F(
+    AnimationBackendSurfaceTest,
+    aTypedValueWrittenBeforeOwnershipIsNotStamped) {
+  write(opacity(0.4));
+  backend->own(view->getFamilyShared(), kPropsNode, {"opacity"});
+  write(folly::dynamic::object("opacity", 0.9));
+
+  reactCommit(folly::dynamic::object("opacity", 0.2));
+
+  EXPECT_EQ(treeProps().opacity, 0.2f);
+}
+
+TEST_F(AnimationBackendSurfaceTest, ownedTypedPropsStayOutOfCommits) {
+  backend->own(view->getFamilyShared(), kPropsNode, {"opacity"});
+  AnimatedPropsBuilder propsBuilder;
+  propsBuilder.setOpacity(0.5);
+  propsBuilder.setWidth(yoga::StyleSizeLength::points(50));
+
+  write(propsBuilder.get(), true);
+  reactCommit(folly::dynamic::object("nativeID", "a"));
+
+  EXPECT_EQ(treeProps().opacity, 0.8f);
+  EXPECT_EQ(
+      treeProps().yogaStyle.dimension(yoga::Dimension::Width),
+      yoga::StyleSizeLength::points(50));
+}
+
+TEST_F(
+    AnimationBackendSurfaceTest,
+    aReconnectionDropsTheFinalValueOfThePreviousConnection) {
+  backend->own(view->getFamilyShared(), kPropsNode, {"opacity"});
+  jsInvoker->defers = true;
+  writeFinished(folly::dynamic::object("opacity", 0.9));
+  backend->release(kPropsNode);
+  backend->own(view->getFamilyShared(), kPropsNode, {"opacity"});
+  write(folly::dynamic::object("opacity", 0.4));
+
+  jsInvoker->runDeferredTasks();
+
+  EXPECT_EQ(treeProps().opacity, 0.8f);
+  reactCommit(folly::dynamic::object("nativeID", "a"));
+  auto transaction = pull();
+  const auto& telemetry = transaction.getTelemetry();
+  EXPECT_EQ(
+      backend->newerDirectWrites(
+          kSurface,
+          {{kView,
+            telemetry.getAnimationStampNumber(),
+            telemetry.getReleaseCoverage()}}),
+      std::vector<folly::dynamic>{folly::dynamic::object("opacity", 0.4)});
+}
+
+TEST_F(AnimationBackendSurfaceTest, aStaleReleaseKeepsNewerWrites) {
+  backend->own(view->getFamilyShared(), kPropsNode, {"opacity"});
+  write(folly::dynamic::object("opacity", 0.5));
+  backend->own(view->getFamilyShared(), kPropsNode + 1, {"opacity"});
+  release(kPropsNode + 1);
+  write(folly::dynamic::object("opacity", 0.7));
+
+  release(kPropsNode);
+  reactCommit(folly::dynamic::object("nativeID", "a"));
+
+  EXPECT_EQ(treeProps().opacity, 0.7f);
+}
+
+namespace {
+
+// Connects a props node that animates `key` of `view` through a style node.
+void connectPropsNode(
+    NativeAnimatedNodesManager& nodesManager,
+    const std::shared_ptr<const ShadowNodeFamily>& family,
+    Tag valueTag,
+    Tag propsNodeTag,
+    const std::string& key,
+    double value) {
+  auto styleTag = valueTag + 1;
+  nodesManager.createAnimatedNode(
+      valueTag,
+      folly::dynamic::object("type", "value")("value", value)("offset", 0));
+  nodesManager.createAnimatedNode(
+      styleTag,
+      folly::dynamic::object("type", "style")(
+          "style", folly::dynamic::object(key, valueTag)));
+  nodesManager.createAnimatedNode(
+      propsNodeTag,
+      folly::dynamic::object("type", "props")(
+          "props", folly::dynamic::object("style", styleTag)));
+  nodesManager.connectAnimatedNodes(valueTag, styleTag);
+  nodesManager.connectAnimatedNodes(styleTag, propsNodeTag);
+  nodesManager.connectAnimatedNodeToView(propsNodeTag, family->getTag());
+  nodesManager.connectAnimatedNodeToShadowNodeFamily(
+      propsNodeTag, std::const_pointer_cast<ShadowNodeFamily>(family));
+}
+
+void startFramesAnimation(
+    NativeAnimatedNodesManager& nodesManager,
+    int animationId,
+    Tag valueTag,
+    size_t frameCount,
+    double toValue) {
+  auto frames = folly::dynamic::array();
+  for (size_t i = 0; i < frameCount; i++) {
+    frames.push_back(static_cast<double>(i) / (frameCount - 1));
+  }
+  nodesManager.startAnimatingNode(
+      animationId,
+      valueTag,
+      folly::dynamic::object("type", "frames")("frames", frames)(
+          "toValue", toValue),
+      std::nullopt);
+}
+
+} // namespace
+
+TEST_F(
+    AnimationBackendSurfaceTest,
+    anEndSyncCommitsOnlyTheFinishedNodesValues) {
+  auto nodesManager = std::make_shared<NativeAnimatedNodesManager>(backend);
+  nodesManager->scheduleOnUI([&] {
+    connectPropsNode(
+        *nodesManager, view->getFamilyShared(), 1, kPropsNode, "opacity", 0.5);
+    connectPropsNode(
+        *nodesManager,
+        view->getFamilyShared(),
+        3,
+        kPropsNode + 1,
+        "shadowOpacity",
+        0.1);
+    startFramesAnimation(*nodesManager, 1, 1, 60, 0.2);
+    startFramesAnimation(*nodesManager, 2, 3, 2, 0.4);
+  });
+
+  backend->onAnimationFrame(AnimationTimestamp{1000});
+  backend->onAnimationFrame(AnimationTimestamp{1100});
+
+  EXPECT_EQ(treeProps().shadowOpacity, 0.4f);
+  EXPECT_EQ(treeProps().opacity, 0.8f);
+}
+
+TEST_F(
+    AnimationBackendSurfaceTest,
+    restoringDefaultValuesDropsTheQueuedFinalValue) {
+  accumulatePropsUpdates();
+  auto nodesManager = std::make_shared<NativeAnimatedNodesManager>(backend);
+  nodesManager->scheduleOnUI([&] {
+    connectPropsNode(
+        *nodesManager, view->getFamilyShared(), 1, kPropsNode, "opacity", 0.5);
+    startFramesAnimation(*nodesManager, 1, 1, 2, 0.9);
+  });
+  jsInvoker->defers = true;
+  backend->onAnimationFrame(AnimationTimestamp{1000});
+  backend->onAnimationFrame(AnimationTimestamp{1100});
+  nodesManager->scheduleOnUI(
+      [&] { nodesManager->restoreDefaultValues(kPropsNode); });
+  backend->onAnimationFrame(AnimationTimestamp{1200});
+
+  jsInvoker->runDeferredTasks();
+  reactCommit(folly::dynamic::object("nativeID", "a"));
+
+  EXPECT_EQ(treeProps().opacity, 0.8f);
+  auto props = updatedProps(pull());
+  ASSERT_NE(props, nullptr);
+  EXPECT_EQ(static_cast<const ViewProps&>(*props).opacity, 0.8f);
+}
+
+TEST_F(AnimationBackendSurfaceTest, structuralPropsAreNotOwned) {
+  auto nodesManager = std::make_shared<NativeAnimatedNodesManager>(backend);
+  nodesManager->scheduleOnUI([&] {
+    connectPropsNode(
+        *nodesManager, view->getFamilyShared(), 1, kPropsNode, "zIndex", 2);
+  });
+  backend->onAnimationFrame(AnimationTimestamp{1000});
+
+  reactCommit(folly::dynamic::object("nativeID", "a"));
+
+  EXPECT_EQ(treeProps().zIndex, 2);
+}
+
+TEST_F(AnimationBackendSurfaceTest, paragraphColorIsNotOwned) {
+  auto paragraph =
+      builder.build(Element<ParagraphShadowNode>().tag(30).surfaceId(kSurface));
+  auto nodesManager = std::make_shared<NativeAnimatedNodesManager>(backend);
+  nodesManager->scheduleOnUI([&] {
+    connectPropsNode(
+        *nodesManager,
+        paragraph->getFamilyShared(),
+        1,
+        kPropsNode,
+        "color",
+        4278190335.0);
+    connectPropsNode(
+        *nodesManager,
+        view->getFamilyShared(),
+        3,
+        kPropsNode + 1,
+        "color",
+        4278190335.0);
+  });
+  backend->onAnimationFrame(AnimationTimestamp{1000});
+
+  reactCommit(folly::dynamic::object("nativeID", "a"));
+
+  auto transaction = pull();
+  const auto& telemetry = transaction.getTelemetry();
+  auto stamp = telemetry.getAnimationStampNumber();
+  auto releaseCoverage = telemetry.getReleaseCoverage();
+  auto newer = backend->newerDirectWrites(
+      kSurface,
+      {{30, stamp, releaseCoverage}, {kView, stamp, releaseCoverage}});
+  EXPECT_EQ(newer.at(0), folly::dynamic(folly::dynamic::object()));
+  EXPECT_EQ(newer.at(1).count("color"), 1u);
+}
+
+TEST_F(AnimationBackendSurfaceTest, aReleaseKeepsTheValuesOfADelegateFrame) {
+  backend->own(view->getFamilyShared(), kPropsNode, {"opacity"});
+  write(folly::dynamic::object("opacity", 0.5));
+  reactCommit(folly::dynamic::object("nativeID", "a"));
+  pull();
+  const auto& node =
+      *shadowTree->getCurrentRevision().rootShadowNode->getChildren().at(0);
+  auto frameView = ShadowView(node);
+  PropsParserContext context{kSurface, *contextContainer};
+  frameView.props = node.getComponentDescriptor().cloneProps(
+      context,
+      node.getProps(),
+      RawProps(folly::dynamic::object("opacity", 0.3)));
+  auto dropping = std::make_shared<DroppingDelegate>();
+  auto frame = std::make_shared<FrameDelegate>(
+      ShadowViewMutation::UpdateMutation(frameView, frameView, kSurface));
+  auto coordinator = shadowTree->getMountingCoordinator();
+  coordinator->setMountingOverrideDelegate(dropping);
+  coordinator->setMountingOverrideDelegate(frame);
+
+  release(kPropsNode);
+
+  auto props = updatedProps(pull());
+  ASSERT_NE(props, nullptr);
+  EXPECT_NE(props, frameView.props);
+  EXPECT_FLOAT_EQ(static_cast<const ViewProps&>(*props).opacity, 0.3f);
+}
+
+TEST_F(
+    AnimationBackendSurfaceTest,
+    mergedGroupsAndDelegatePullsKeepTheirReleaseCoverage) {
+  backend->own(view->getFamilyShared(), kPropsNode, {"opacity"});
+  write(folly::dynamic::object("opacity", 0.5));
+  reactCommit(folly::dynamic::object("nativeID", "a"));
+  auto merged = pull();
+  release(kPropsNode);
+  merged.mergeWith(pull());
+  const auto& node =
+      *shadowTree->getCurrentRevision().rootShadowNode->getChildren().at(0);
+  auto frame =
+      std::make_shared<FrameDelegate>(ShadowViewMutation::UpdateMutation(
+          ShadowView(node), ShadowView(node), kSurface));
+  shadowTree->getMountingCoordinator()->setMountingOverrideDelegate(frame);
+
+  auto synthetic = shadowTree->getMountingCoordinator()->pullTransaction();
+
+  const auto& stamps = merged.getAnimationStamps();
+  ASSERT_EQ(stamps.size(), 2u);
+  ASSERT_TRUE(synthetic.has_value());
+  const auto& telemetry = synthetic->getTelemetry();
+  EXPECT_EQ(telemetry.getReleaseCoverage(), stamps[1].releaseCoverage);
+  EXPECT_EQ(
+      backend->newerDirectWrites(
+          kSurface,
+          {{kView, stamps[0].number, stamps[0].releaseCoverage},
+           {kView, stamps[1].number, stamps[1].releaseCoverage},
+           {kView,
+            telemetry.getAnimationStampNumber(),
+            telemetry.getReleaseCoverage()}}),
+      (std::vector<folly::dynamic>{
+          folly::dynamic::object("opacity", 0.5),
+          folly::dynamic::object(),
+          folly::dynamic::object()}));
+}
+
+namespace {
+
+class ViewCullingFlags : public AccumulatedPropsFlags {
+ public:
+  bool enableViewCulling() override {
+    return true;
+  }
+};
+
+constexpr Tag kScrollView = 20;
+
+} // namespace
+
+// `view` in a 100x100 scroll view, which culls the views outside of it.
+class AnimationBackendCullingTest : public AnimationBackendSurfaceTest {
+ protected:
+  std::shared_ptr<const ShadowNode> buildRootChild() override {
+    ReactNativeFeatureFlags::dangerouslyReset();
+    ReactNativeFeatureFlags::override(std::make_unique<ViewCullingFlags>());
+    return builder.build(
+        Element<ScrollViewShadowNode>()
+            .tag(kScrollView)
+            .surfaceId(kSurface)
+            .props([] {
+              auto props = std::make_shared<ScrollViewProps>();
+              props->yogaStyle.setDimension(
+                  yoga::Dimension::Width, yoga::StyleSizeLength::points(100));
+              props->yogaStyle.setDimension(
+                  yoga::Dimension::Height, yoga::StyleSizeLength::points(100));
+              props->yogaStyle.setOverflow(yoga::Overflow::Scroll);
+              return props;
+            })
+            .children({Element<ViewShadowNode>()
+                           .tag(kView)
+                           .surfaceId(kSurface)
+                           .reference(view)
+                           .props([] {
+                             auto props = std::make_shared<ViewProps>();
+                             props->opacity = 0.8;
+                             props->yogaStyle.setPositionType(
+                                 yoga::PositionType::Absolute);
+                             props->yogaStyle.setDimension(
+                                 yoga::Dimension::Width,
+                                 yoga::StyleSizeLength::points(10));
+                             props->yogaStyle.setDimension(
+                                 yoga::Dimension::Height,
+                                 yoga::StyleSizeLength::points(10));
+                             return props;
+                           })}));
+  }
+
+  static bool deletes(const MountingTransaction& transaction, Tag tag) {
+    const auto& mutations = transaction.getMutations();
+    return std::any_of(
+        mutations.begin(), mutations.end(), [&](const auto& mutation) {
+          return mutation.type == ShadowViewMutation::Delete &&
+              mutation.oldChildShadowView.tag == tag;
+        });
+  }
+
+  void moveView(int top) {
+    reactCommit(folly::dynamic::object("top", top));
+  }
+};
+
+TEST_F(AnimationBackendCullingTest, aCulledReleasedViewIsNotUpdated) {
+  backend->own(view->getFamilyShared(), kPropsNode, {"opacity"});
+  write(folly::dynamic::object("opacity", 0.5));
+  moveView(1000);
+  ASSERT_TRUE(deletes(pull(), kView));
+
+  release(kPropsNode);
+
+  auto transaction = pull();
+  EXPECT_GT(transaction.getTelemetry().getReleaseCoverage(), 0u);
+  EXPECT_EQ(updatedProps(transaction), nullptr);
+}
+
+TEST_F(
+    AnimationBackendCullingTest,
+    aReleasedViewCulledInTheSameTransactionIsNotUpdated) {
+  backend->own(view->getFamilyShared(), kPropsNode, {"opacity"});
+  write(folly::dynamic::object("opacity", 0.5));
+  reactCommit(folly::dynamic::object("nativeID", "a"));
+  pull();
+
+  release(kPropsNode);
+  moveView(1000);
+
+  auto transaction = pull();
+  EXPECT_GT(transaction.getTelemetry().getReleaseCoverage(), 0u);
+  EXPECT_TRUE(deletes(transaction, kView));
+  EXPECT_EQ(updatedProps(transaction), nullptr);
+}
+
+TEST_F(AnimationBackendCullingTest, aReleasedViewCreatedAgainShowsReactsValue) {
+  backend->own(view->getFamilyShared(), kPropsNode, {"opacity"});
+  write(folly::dynamic::object("opacity", 0.5));
+  moveView(1000);
+  pull();
+  release(kPropsNode);
+  pull();
+
+  moveView(0);
+
+  auto transaction = pull();
+  const auto& mutations = transaction.getMutations();
+  auto create = std::find_if(
+      mutations.begin(), mutations.end(), [](const auto& mutation) {
+        return mutation.type == ShadowViewMutation::Create &&
+            mutation.newChildShadowView.tag == kView;
+      });
+  ASSERT_NE(create, mutations.end());
+  EXPECT_EQ(
+      static_cast<const ViewProps&>(*create->newChildShadowView.props).opacity,
+      0.8f);
+}
+
+TEST_F(AnimationBackendSurfaceTest, anOwnedTypedWriteWinsUntilItsRelease) {
+  backend->own(view->getFamilyShared(), kPropsNode, {"opacity"});
+  write(opacity(0.5));
+
+  reactCommit(folly::dynamic::object("opacity", 0.2));
+  EXPECT_FLOAT_EQ(mountedOpacity(pull()), 0.5f);
+  release(kPropsNode);
+
+  auto transaction = pull();
+  EXPECT_GT(transaction.getTelemetry().getReleaseCoverage(), 0u);
+  EXPECT_FLOAT_EQ(mountedOpacity(transaction), 0.2f);
+}
+
+namespace {
+
+// Cancels release commits while `cancels`, after the hooks registered before
+// it.
+class ReleaseCancellingHook : public UIManagerCommitHook {
+ public:
+  void commitHookWasRegistered(
+      const UIManager& /*uiManager*/) noexcept override {}
+  void commitHookWasUnregistered(
+      const UIManager& /*uiManager*/) noexcept override {}
+
+  RootShadowNode::Unshared shadowTreeWillCommit(
+      const ShadowTree& /*shadowTree*/,
+      const RootShadowNode::Shared& /*oldRootShadowNode*/,
+      const RootShadowNode::Unshared& newRootShadowNode,
+      const ShadowTreeCommitOptions& commitOptions) noexcept override {
+    if (commitOptions.source != ShadowTreeCommitSource::AnimatedPropsRelease) {
+      return newRootShadowNode;
+    }
+    attempts++;
+    return cancels ? nullptr : newRootShadowNode;
+  }
+
+  bool cancels{true};
+  int attempts{0};
+};
+
+} // namespace
+
+TEST_F(AnimationBackendSurfaceTest, cancelledReleasesAreRetriedOnceAFrame) {
+  backend->own(view->getFamilyShared(), kPropsNode, {"opacity"});
+  backend->own(view->getFamilyShared(), kPropsNode + 1, {"shadowOpacity"});
+  write(folly::dynamic::object("opacity", 0.5)("shadowOpacity", 0.3));
+  reactCommit(folly::dynamic::object("nativeID", "a"));
+  pull();
+  ReleaseCancellingHook hook;
+  uiManager->registerCommitHook(hook);
+  jsInvoker->defers = true;
+  release(kPropsNode);
+  jsInvoker->runQueuedTasks();
+  backend->onAnimationFrame(AnimationTimestamp{1000});
+  release(kPropsNode + 1);
+  jsInvoker->runQueuedTasks();
+  EXPECT_EQ(jsInvoker->queuedTaskCount(), 0u);
+
+  reactCommit(folly::dynamic::object("opacity", 0.2)("shadowOpacity", 0.1));
+  auto cancelled = pull();
+  hook.cancels = false;
+  backend->onAnimationFrame(AnimationTimestamp{1016});
+  backend->onAnimationFrame(AnimationTimestamp{1032});
+  EXPECT_EQ(jsInvoker->queuedTaskCount(), 1u);
+  jsInvoker->runQueuedTasks();
+  auto committed = pull();
+  backend->onAnimationFrame(AnimationTimestamp{1048});
+
+  uiManager->unregisterCommitHook(hook);
+  EXPECT_EQ(jsInvoker->queuedTaskCount(), 0u);
+  EXPECT_EQ(cancelled.getTelemetry().getReleaseCoverage(), 0u);
+  EXPECT_FLOAT_EQ(mountedOpacity(cancelled), 0.5f);
+  EXPECT_GT(committed.getTelemetry().getReleaseCoverage(), 0u);
+  EXPECT_FLOAT_EQ(mountedOpacity(committed), 0.2f);
+  EXPECT_FLOAT_EQ(treeProps().shadowOpacity, 0.1f);
+}
+
+TEST_F(
+    AnimationBackendSurfaceTest,
+    aCancelledReleaseCommittedAgainKeepsANewerOwner) {
+  backend->own(view->getFamilyShared(), kPropsNode, {"opacity"});
+  write(folly::dynamic::object("opacity", 0.5));
+  ReleaseCancellingHook hook;
+  uiManager->registerCommitHook(hook);
+  jsInvoker->defers = true;
+  release(kPropsNode);
+  jsInvoker->runQueuedTasks();
+  hook.cancels = false;
+
+  backend->own(view->getFamilyShared(), kPropsNode + 1, {"opacity"});
+  write(folly::dynamic::object("opacity", 0.7));
+  backend->onAnimationFrame(AnimationTimestamp{1000});
+  jsInvoker->runDeferredTasks();
+
+  uiManager->unregisterCommitHook(hook);
+  auto transaction = pull();
+  EXPECT_GT(transaction.getTelemetry().getReleaseCoverage(), 0u);
+  EXPECT_FLOAT_EQ(mountedOpacity(transaction), 0.7f);
+}
+
+TEST_F(AnimationBackendSurfaceTest, aStoppedSurfaceDropsItsCancelledRelease) {
+  backend->own(view->getFamilyShared(), kPropsNode, {"opacity"});
+  write(folly::dynamic::object("opacity", 0.5));
+  ReleaseCancellingHook hook;
+  uiManager->registerCommitHook(hook);
+  jsInvoker->defers = true;
+  release(kPropsNode);
+  jsInvoker->runQueuedTasks();
+  backend->onAnimationFrame(AnimationTimestamp{1000});
+  uiManager->unregisterCommitHook(hook);
+  std::weak_ptr<const ShadowNodeFamily> family = view->getFamilyShared();
+
+  uiManager->stopSurface(kSurface).reset();
+  backend->clearRegistryOnSurfaceStop(kSurface);
+  view.reset();
+
+  EXPECT_TRUE(family.expired());
+  jsInvoker->runQueuedTasks();
+  backend->onAnimationFrame(AnimationTimestamp{1016});
+  EXPECT_EQ(jsInvoker->queuedTaskCount(), 0u);
+}
+
+TEST_F(AnimationBackendSurfaceTest, aPendingReleaseOfRemovedViewsIsDropped) {
+  backend->own(view->getFamilyShared(), kPropsNode, {"opacity"});
+  write(folly::dynamic::object("opacity", 0.5));
+  ReleaseCancellingHook hook;
+  uiManager->registerCommitHook(hook);
+  jsInvoker->defers = true;
+  release(kPropsNode);
+  jsInvoker->runQueuedTasks();
+  std::weak_ptr<const ShadowNodeFamily> family = view->getFamilyShared();
+
+  commitRootChildren({});
+  pull();
+  view.reset();
+  ASSERT_TRUE(family.expired());
+  auto attempts = hook.attempts;
+  for (int frame = 0; frame < 3; frame++) {
+    backend->onAnimationFrame(AnimationTimestamp{1000.0 + 16 * frame});
+    jsInvoker->runQueuedTasks();
+  }
+  backend->onAnimationFrame(AnimationTimestamp{1048});
+
+  uiManager->unregisterCommitHook(hook);
+  EXPECT_EQ(hook.attempts, attempts);
+  EXPECT_EQ(jsInvoker->queuedTaskCount(), 0u);
+}
+
+TEST_F(
+    AnimationBackendSurfaceTest,
+    aPendingReleaseKeepsItsViewsThatAreStillMounted) {
+  auto other = builder.build(
+      Element<ViewShadowNode>().tag(kView + 1).surfaceId(kSurface).props([] {
+        auto props = std::make_shared<ViewProps>();
+        props->opacity = 0.6;
+        return props;
+      }));
+  commitRootChildren({view, other});
+  pull();
+  backend->own(view->getFamilyShared(), kPropsNode, {"opacity"});
+  backend->own(other->getFamilyShared(), kPropsNode + 1, {"opacity"});
+  AnimationMutations mutations;
+  for (const auto& node : {view, other}) {
+    mutations.batch.push_back(
+        AnimationMutation{
+            .tag = node->getTag(),
+            .family = node->getFamilyShared(),
+            .props = {
+                .props = {},
+                .rawProps = std::make_unique<RawProps>(
+                    folly::dynamic::object("opacity", 0.5))}});
+  }
+  write(std::move(mutations));
+  ReleaseCancellingHook hook;
+  uiManager->registerCommitHook(hook);
+  jsInvoker->defers = true;
+  backend->release(kPropsNode);
+  backend->release(kPropsNode + 1);
+  write(AnimationMutations{});
+  jsInvoker->runQueuedTasks();
+  std::weak_ptr<const ShadowNodeFamily> otherFamily = other->getFamilyShared();
+  commitRootChildren({view});
+  pull();
+  other.reset();
+  ASSERT_TRUE(otherFamily.expired());
+
+  hook.cancels = false;
+  backend->onAnimationFrame(AnimationTimestamp{1000});
+  jsInvoker->runQueuedTasks();
+
+  uiManager->unregisterCommitHook(hook);
+  auto transaction = pull();
+  EXPECT_EQ(hook.attempts, 2);
+  EXPECT_GT(transaction.getTelemetry().getReleaseCoverage(), 0u);
+  EXPECT_FLOAT_EQ(mountedOpacity(transaction), 0.8f);
+}
+
+TEST_F(AnimationBackendSurfaceTest, aFinishedValueIsTheOneTheFrameWrote) {
+  backend->own(view->getFamilyShared(), kPropsNode, {"opacity"});
+  AnimatedPropsBuilder propsBuilder;
+  propsBuilder.setOpacity(0.7);
+  propsBuilder.setWidth(yoga::StyleSizeLength::points(50));
+  auto props = propsBuilder.get();
+  props.rawProps =
+      std::make_unique<RawProps>(folly::dynamic::object("opacity", 0.3));
+  AnimationMutations mutations;
+  mutations.batch.push_back(mutation(std::move(props)));
+  mutations.batch.back().hasLayoutUpdates = true;
+  mutations.batch.back().finishedKeys = {"opacity"};
+  mutations.asyncFlushSurfaces.insert(kSurface);
+
+  write(std::move(mutations));
+  release(kPropsNode);
+
+  EXPECT_FLOAT_EQ(treeProps().opacity, 0.7f);
+  EXPECT_FLOAT_EQ(mountedOpacity(pull()), 0.7f);
+}
+
+TEST_F(
+    AnimationBackendSurfaceTest,
+    aNodeConnectedBeforeTheWritersDisconnectionKeepsTheValue) {
+  backend->own(view->getFamilyShared(), kPropsNode, {"opacity"});
+  write(folly::dynamic::object("opacity", 0.5));
+  backend->own(view->getFamilyShared(), kPropsNode + 1, {"opacity"});
+  release(kPropsNode);
+
+  reactCommit(folly::dynamic::object("opacity", 0.2));
+  auto owned = pull();
+  release(kPropsNode + 1);
+  auto released = pull();
+
+  EXPECT_EQ(owned.getTelemetry().getReleaseCoverage(), 0u);
+  EXPECT_FLOAT_EQ(mountedOpacity(owned), 0.5f);
+  EXPECT_GT(released.getTelemetry().getReleaseCoverage(), 0u);
+  EXPECT_FLOAT_EQ(mountedOpacity(released), 0.2f);
+}
+
+TEST_F(AnimationBackendSurfaceTest, aReconnectedNodeDoesNotKeepTheValue) {
+  backend->own(view->getFamilyShared(), kPropsNode, {"opacity"});
+  write(folly::dynamic::object("opacity", 0.5));
+  reactCommit(folly::dynamic::object("nativeID", "a"));
+  pull();
+
+  backend->release(kPropsNode);
+  backend->own(view->getFamilyShared(), kPropsNode, {"opacity"});
+  write(AnimationMutations{});
+
+  auto transaction = pull();
+  EXPECT_GT(transaction.getTelemetry().getReleaseCoverage(), 0u);
+  EXPECT_FLOAT_EQ(mountedOpacity(transaction), 0.8f);
+}
+
+TEST_F(
+    AnimationBackendSurfaceTest,
+    anEndSyncCommitsTheValueItTookBeforeANewOwner) {
+  backend->own(view->getFamilyShared(), kPropsNode, {"opacity"});
+  EndSyncHook hook([&] {
+    jsInvoker->defers = true;
+    backend->own(view->getFamilyShared(), kPropsNode + 1, {"opacity"});
+    write(folly::dynamic::object("opacity", 0.4));
+  });
+  uiManager->registerCommitHook(hook);
+  jsInvoker->defers = true;
+  writeFinished(folly::dynamic::object("opacity", 0.9));
+
+  jsInvoker->runDeferredTasks();
+
+  uiManager->unregisterCommitHook(hook);
+  EXPECT_FLOAT_EQ(treeProps().opacity, 0.9f);
+  reactCommit(folly::dynamic::object("nativeID", "a"));
+  EXPECT_FLOAT_EQ(mountedOpacity(pull()), 0.4f);
 }
 
 } // namespace facebook::react

@@ -821,6 +821,8 @@ test('AnimatedValue.interpolate', () => {
   if (!ReactNativeFeatureFlags.useSharedAnimatedBackend()) {
     expect(viewElement.getBoundingClientRect().y).toBe(75);
   }
+  // Runs the release of the props replaced by the second render.
+  Fantom.runWorkLoop();
 });
 
 test('Animated.sequence', () => {

@@ -76,7 +76,7 @@ class AnimatedPropsRegistryTest : public ::testing::Test {
   }
 
   PropsSnapshot& snapshot() {
-    stamped = registry.takeStampingSnapshot(1);
+    stamped = registry.takeStampingSnapshot(1, false);
     return stamped.props.at(10);
   }
 
@@ -89,6 +89,14 @@ class AnimatedPropsRegistryTest : public ::testing::Test {
       uint64_t stampNumber,
       const folly::dynamic& expected) {
     EXPECT_EQ(newerDirectWrites(stampNumber), expected);
+  }
+
+  size_t connectionCount() const {
+    return registry.connections_.size();
+  }
+
+  size_t releasedFamilyCount() const {
+    return registry.surfaceContexts_.at(1).releasedFamilies.size();
   }
 };
 
@@ -334,7 +342,7 @@ TEST_F(AnimatedPropsRegistryTest, stoppedSurfacesIgnoreUpdates) {
   registry.clearOnSurfaceStop(1);
   updateRaw(folly::dynamic::object("opacity", 0.5));
   registry.initializeSurface(1);
-  EXPECT_TRUE(registry.takeStampingSnapshot(1).props.empty());
+  EXPECT_TRUE(registry.takeStampingSnapshot(1, false).props.empty());
   EXPECT_EQ(newerDirectWrites(0), nullptr);
 }
 
@@ -391,12 +399,12 @@ TEST_F(AnimatedPropsRegistryTest, surfaceStopDropsDirectWrites) {
   registry.clearOnSurfaceStop(1);
 
   EXPECT_EQ(newerDirectWrites(0), nullptr);
-  EXPECT_FALSE(registry.shouldOverridePullTransaction());
+  EXPECT_FALSE(registry.hasDirectWrites(1));
 }
 
 TEST_F(AnimatedPropsRegistryTest, stampingSnapshotsAreCopies) {
   updateRaw(folly::dynamic::object("opacity", 0.25));
-  auto first = registry.takeStampingSnapshot(1);
+  auto first = registry.takeStampingSnapshot(1, false);
 
   updateRaw(folly::dynamic::object("opacity", 0.5));
   snapshot();
@@ -412,19 +420,90 @@ TEST_F(AnimatedPropsRegistryTest, pulledMutationsGetNewerDirectWrites) {
   auto pull = [&](uint64_t stampNumber) {
     TransactionTelemetry telemetry;
     telemetry.setAnimationStampNumber(stampNumber);
-    auto transaction = registry.pullTransaction(
-        1,
-        1,
-        telemetry,
-        {ShadowViewMutation::UpdateMutation(
-            ShadowView(*node), ShadowView(*node), 1)});
+    auto transaction = registry.finalizeTransaction(
+        MountingTransaction{
+            1,
+            1,
+            {ShadowViewMutation::UpdateMutation(
+                ShadowView(*node), ShadowView(*node), 1)},
+            telemetry},
+        *node);
     return static_cast<const ViewProps&>(
-               *transaction->getMutations().at(0).newChildShadowView.props)
+               *transaction.getMutations().at(0).newChildShadowView.props)
         .opacity;
   };
 
+#ifdef ANDROID
+  // Android judges direct writes when it executes mount batches.
+  EXPECT_EQ(pull(stamp), 1.0f);
+#else
   EXPECT_EQ(pull(stamp), 0.5f);
+#endif
   EXPECT_EQ(pull(stamp + 1), 1.0f);
+}
+
+TEST_F(AnimatedPropsRegistryTest, surfaceStopDropsOwnership) {
+  registry.own(node->getFamilyShared(), 100, {"opacity"});
+
+  registry.clearOnSurfaceStop(1);
+
+  EXPECT_FALSE(registry.disconnect(100).has_value());
+}
+
+TEST_F(AnimatedPropsRegistryTest, aMountedViewKeepsOnlyItsNeededConnections) {
+  for (int cycle = 0; cycle < 100; cycle++) {
+    registry.own(node->getFamilyShared(), 100, {"opacity"});
+    registry.own(node->getFamilyShared(), 101, {"opacity"});
+    if (cycle % 2 == 0) {
+      updateRaw(folly::dynamic::object("opacity", cycle / 100.0));
+    }
+    registry.releaseOnSurface(1, {*registry.disconnect(100)});
+    registry.releaseOnSurface(1, {*registry.disconnect(101)});
+  }
+
+  EXPECT_EQ(connectionCount(), 1u);
+  EXPECT_EQ(
+      registry.newerDirectWrites(1, {{10, 0, 0}}).at(0),
+      folly::dynamic(folly::dynamic::object("opacity", 0.98)));
+  EXPECT_EQ(
+      registry.newerDirectWrites(1, {{10, 0, 1000}}).at(0),
+      folly::dynamic(folly::dynamic::object()));
+}
+
+TEST_F(AnimatedPropsRegistryTest, releasesOfExpiredViewsAreForgotten) {
+  for (int cycle = 0; cycle < 20; cycle++) {
+    auto view = builder.build(Element<ViewShadowNode>().surfaceId(1).tag(11));
+    registry.own(view->getFamilyShared(), 100, {"opacity"});
+    std::unordered_map<SurfaceId, std::unordered_map<Tag, AnimationMutation>>
+        surfaceUpdates;
+    surfaceUpdates[1].emplace(
+        11,
+        AnimationMutation{
+            .tag = 11,
+            .family = view->getFamilyShared(),
+            .props = {
+                .props = {},
+                .rawProps = std::make_unique<RawProps>(
+                    folly::dynamic::object("opacity", 0.5))}});
+    registry.update(surfaceUpdates);
+    registry.releaseOnSurface(1, {*registry.disconnect(100)});
+  }
+  EXPECT_EQ(releasedFamilyCount(), 20u);
+
+  registry.takeStampingSnapshot(1, false);
+
+  EXPECT_EQ(releasedFamilyCount(), 0u);
+}
+
+TEST_F(AnimatedPropsRegistryTest, anExpiredViewEndsItsConnections) {
+  {
+    auto view = builder.build(Element<ViewShadowNode>().surfaceId(1).tag(11));
+    registry.own(view->getFamilyShared(), 100, {"opacity"});
+  }
+
+  registry.takeStampingSnapshot(1, false);
+
+  EXPECT_FALSE(registry.disconnect(100).has_value());
 }
 
 TEST_F(AnimatedPropsRegistryTest, expiredViewsAreDroppedOnTheNextSnapshot) {
@@ -442,12 +521,12 @@ TEST_F(AnimatedPropsRegistryTest, expiredViewsAreDroppedOnTheNextSnapshot) {
                 .rawProps = std::make_unique<RawProps>(
                     folly::dynamic::object("opacity", 0.5))}});
     registry.update(surfaceUpdates);
-    registry.takeStampingSnapshot(1);
+    registry.takeStampingSnapshot(1, false);
     registry.clear(1);
   }
   EXPECT_TRUE(registry.hasDirectWrites(1));
 
-  registry.takeStampingSnapshot(1);
+  registry.takeStampingSnapshot(1, false);
 
   EXPECT_FALSE(registry.hasDirectWrites(1));
 }

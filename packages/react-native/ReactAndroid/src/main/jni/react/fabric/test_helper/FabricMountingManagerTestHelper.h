@@ -58,6 +58,11 @@ class FabricMountingManagerTestHelper : public jni::HybridClass<FabricMountingMa
   void registerViewComponent(ComponentFactory *componentFactory);
 
   void commitViews(jint surfaceId, jni::alias_ref<jni::JArrayInt> tags);
+  // Commits props to a view committed by commitViews; only the given props
+  // are its raw props.
+  void
+  commitViewProps(jint surfaceId, jint tag, jni::alias_ref<NativeMap::javaobject> props, jboolean mountSynchronously);
+
   // Writes through the animation backend of useSharedAnimatedBackend to
   // views created by createView, which commitReactViews commits as React
   // would.
@@ -66,6 +71,9 @@ class FabricMountingManagerTestHelper : public jni::HybridClass<FabricMountingMa
   // Writes opacity and marginTop of `props` as typed props.
   void writeTypedProps(jint tag, jni::alias_ref<NativeMap::javaobject> props);
   void requestPreallocation(jint tag);
+  // The animation backend runs its JS tasks immediately from now on.
+  void own(jint tag, jint propsNodeTag, jni::alias_ref<jni::JArrayClass<jstring>> keys);
+  void release(jint propsNodeTag);
   void commitReactViews(jint surfaceId, jni::alias_ref<jni::JArrayInt> tags);
   // Mounts a frame of an animation setting `props` of the view, without a new
   // revision, as LayoutAnimation does.
@@ -102,6 +110,7 @@ class FabricMountingManagerTestHelper : public jni::HybridClass<FabricMountingMa
 
   std::shared_ptr<UIManager> getUIManager();
   void write(Tag tag, AnimatedProps props);
+  class ImmediateJSInvoker;
 };
 
 } // namespace facebook::react

@@ -79,6 +79,14 @@ private constructor(fabricUIManager: FabricUIManager) : HybridClassBase() {
 
   external fun commitViews(surfaceId: Int, tags: IntArray)
 
+  /** Commits [props] to a view of [commitViews]; only these are its raw props. */
+  external fun commitViewProps(
+      surfaceId: Int,
+      tag: Int,
+      props: NativeMap,
+      mountSynchronously: Boolean,
+  )
+
   /**
    * Writes through the animation backend of useSharedAnimatedBackend to views of [createView],
    * committed as React would by [commitReactViews].
@@ -91,6 +99,11 @@ private constructor(fabricUIManager: FabricUIManager) : HybridClassBase() {
   external fun writeTypedProps(tag: Int, props: NativeMap)
 
   external fun requestPreallocation(tag: Int)
+
+  /** A C++ Animated props node owns [keys] of the view; the backend's JS tasks run immediately. */
+  external fun own(tag: Int, propsNodeTag: Int, keys: Array<String>)
+
+  external fun release(propsNodeTag: Int)
 
   external fun commitReactViews(surfaceId: Int, tags: IntArray)
 
