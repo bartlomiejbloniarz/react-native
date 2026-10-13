@@ -13,6 +13,7 @@
 #include <React/RendererCore.h>
 #include <React/View.h>
 #include <folly/dynamic.h>
+#include <react/renderer/mounting/MountingOverrideDelegate.h>
 #include <react/renderer/uimanager/UIManager.h>
 #include <react/renderer/uimanager/UIManagerCommitHook.h>
 #include "AnimatedProps.h"
@@ -23,6 +24,8 @@ namespace facebook::react {
 struct PropsSnapshot {
   std::unique_ptr<BaseViewProps> props;
   std::unordered_set<PropName> propNames;
+  // The edges that typed margin, padding, position and border width set.
+  std::unordered_map<PropName, std::unordered_set<yoga::Edge>> layoutEdges;
   std::unique_ptr<folly::dynamic> rawProps;
 };
 
@@ -33,24 +36,99 @@ struct SurfaceContext {
 
 using SnapshotMap = std::unordered_map<Tag, std::unique_ptr<PropsSnapshot>>;
 
+// The animated props a React commit stamps, and the write number they cover:
+// every write up to it.
+struct StampingSnapshot {
+  uint64_t number{0};
+  std::unordered_set<std::shared_ptr<const ShadowNodeFamily>> families;
+  std::unordered_map<Tag, PropsSnapshot> props;
+};
+
+// The props the backend last wrote straight to a view, each with the number
+// of the frame that wrote it.
+struct DirectWrites {
+  std::weak_ptr<const ShadowNodeFamily> family;
+  std::unordered_map<std::string, std::pair<uint64_t, folly::dynamic>> rawProps;
+  std::unordered_map<PropName, uint64_t> typedPropNumbers;
+  std::unique_ptr<BaseViewProps> typedProps;
+};
+
 /*
  * Merges raw animated props per key, like the props merged by the animation
  * drivers. A null value is kept, so it still resets the prop on commit.
  */
 void mergeAnimatedRawProps(folly::dynamic &target, const folly::dynamic &source);
 
-class AnimatedPropsRegistry {
+#ifdef RN_SERIALIZABLE_STATE
+// The values `newProps` gives the keys of `assumedNative`, where they differ
+// from the values the native view is assumed to show.
+folly::dynamic restoreValues(
+    SurfaceId surfaceId,
+    const ComponentDescriptor &componentDescriptor,
+    const Props::Shared &newProps,
+    const folly::dynamic &assumedNative);
+#endif
+
+// A mount of a revision stamped before a direct write keeps the written
+// props: a direct write wins when its number is greater than the stamp.
+class AnimatedPropsRegistry : public MountingOverrideDelegate {
  public:
-  void update(const std::vector<AnimationMutations> &batches);
+  // Records a frame's mutations, merged per view, and returns the frame's
+  // write number.
+  uint64_t update(const std::unordered_map<SurfaceId, std::unordered_map<Tag, AnimationMutation>> &surfaceUpdates);
   void initializeSurface(SurfaceId surfaceId);
   void clear(SurfaceId surfaceId);
   void clearOnSurfaceStop(SurfaceId surfaceId);
-  std::pair<std::unordered_set<std::shared_ptr<const ShadowNodeFamily>> &, SnapshotMap &> getMap(SurfaceId surfaceId);
+  StampingSnapshot takeStampingSnapshot(SurfaceId surfaceId);
+
+  std::vector<folly::dynamic> newerDirectWrites(
+      SurfaceId surfaceId,
+      const std::vector<std::pair<Tag, uint64_t>> &stampedViews) const;
+  bool hasDirectWrites(SurfaceId surfaceId) const;
+#ifdef RN_SERIALIZABLE_STATE
+  folly::dynamic restoreDirectWrites(
+      SurfaceId surfaceId,
+      Tag tag,
+      const Props::Shared &props,
+      const Props::Shared &preallocatedProps) const;
+#endif
+
+  bool shouldOverridePullTransaction() const override;
+  std::optional<MountingTransaction> pullTransaction(
+      SurfaceId surfaceId,
+      MountingTransaction::Number number,
+      const TransactionTelemetry &telemetry,
+      ShadowViewMutationList mutations) const override;
 
  private:
+  void recordDirectWrite(const AnimationMutation &mutation, const folly::dynamic *rawProps);
+  folly::dynamic newerDirectWrites(const DirectWrites &view, uint64_t stampNumber) const;
+
   std::unordered_map<SurfaceId, SurfaceContext> surfaceContexts_;
-  std::mutex mutex_;
+  std::unordered_map<SurfaceId, std::unordered_map<Tag, DirectWrites>> directWrites_;
+  uint64_t writeNumber_{0};
+  mutable std::mutex mutex_;
 };
+
+inline void updateLayoutEdge(PropName propName, yoga::Edge edge, BaseViewProps &viewProps, const BaseViewProps &source)
+{
+  switch (propName) {
+    case MARGIN:
+      viewProps.yogaStyle.setMargin(edge, source.yogaStyle.margin(edge));
+      break;
+    case PADDING:
+      viewProps.yogaStyle.setPadding(edge, source.yogaStyle.padding(edge));
+      break;
+    case POSITION:
+      viewProps.yogaStyle.setPosition(edge, source.yogaStyle.position(edge));
+      break;
+    case BORDER_WIDTH:
+      viewProps.yogaStyle.setBorder(edge, source.yogaStyle.border(edge));
+      break;
+    default:
+      break;
+  }
+}
 
 inline void updateProp(const PropName propName, BaseViewProps &viewProps, const PropsSnapshot &snapshot)
 {

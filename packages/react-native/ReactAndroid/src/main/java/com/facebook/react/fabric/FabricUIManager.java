@@ -878,7 +878,7 @@ public class FabricUIManager
           rawPropsBuffer.length);
     }
 
-    new BatchedAnimatedPropsMountItem(intBuffer, doubleBuffer, rawPropsBuffer, mMountItemDispatcher)
+    new BatchedAnimatedPropsMountItem(intBuffer, doubleBuffer, rawPropsBuffer)
         .execute(mMountingManager);
 
     ReactMarker.logFabricMarker(
@@ -961,12 +961,21 @@ public class FabricUIManager
   @AnyThread
   @ThreadConfined(ANY)
   private MountItem createIntBufferBatchMountItem(
-      int rootTag, @Nullable int[] intBuffer, @Nullable Object[] objBuffer, int commitNumber) {
+      int rootTag,
+      @Nullable int[] intBuffer,
+      @Nullable Object[] objBuffer,
+      int commitNumber,
+      @Nullable int[] animatedViews,
+      @Nullable long[] animationStamps) {
+    FabricUIManagerBinding binding = mBinding;
     return MountItemFactory.createIntBufferBatchMountItem(
         rootTag,
         intBuffer == null ? new int[0] : intBuffer,
         objBuffer == null ? new Object[0] : objBuffer,
-        commitNumber);
+        commitNumber,
+        animatedViews == null || animationStamps == null || binding == null
+            ? null
+            : () -> binding.newerDirectWrites(rootTag, animatedViews, animationStamps));
   }
 
   /**

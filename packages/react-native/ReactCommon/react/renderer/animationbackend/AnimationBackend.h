@@ -50,6 +50,17 @@ class AnimationBackend : public UIManagerAnimationBackend {
   void clearRegistry(SurfaceId surfaceId) override;
   void clearRegistryOnSurfaceStop(SurfaceId surfaceId) override;
   void registerJSInvoker(std::shared_ptr<CallInvoker> jsInvoker) override;
+  std::vector<folly::dynamic> newerDirectWrites(
+      SurfaceId surfaceId,
+      const std::vector<std::pair<Tag, uint64_t>> &stampedViews) override;
+  bool hasDirectWrites(SurfaceId surfaceId) override;
+#ifdef RN_SERIALIZABLE_STATE
+  folly::dynamic restoreDirectWrites(
+      SurfaceId surfaceId,
+      Tag tag,
+      const Props::Shared &props,
+      const Props::Shared &preallocatedProps) override;
+#endif
 
   void onAnimationFrame(AnimationTimestamp timestamp) override;
   void trigger() override;

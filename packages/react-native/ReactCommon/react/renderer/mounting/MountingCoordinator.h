@@ -106,6 +106,12 @@ class MountingCoordinator final {
   void setMountingOverrideDelegate(std::weak_ptr<const MountingOverrideDelegate> delegate) const;
 
   /*
+   * Sets the delegate that rewrites each pulled transaction after all the
+   * others, without producing transactions of its own.
+   */
+  void setFinalMountingOverrideDelegate(std::weak_ptr<const MountingOverrideDelegate> delegate) const;
+
+  /*
    * Methods from this section are meant to be used by `ShadowTree` only.
    */
  private:
@@ -133,6 +139,7 @@ class MountingCoordinator final {
   mutable MountingTransaction::Number number_{0};
   mutable std::condition_variable signal_;
   mutable std::vector<std::weak_ptr<const MountingOverrideDelegate>> mountingOverrideDelegates_;
+  mutable std::weak_ptr<const MountingOverrideDelegate> finalMountingOverrideDelegate_;
 
   TelemetryController telemetryController_;
 

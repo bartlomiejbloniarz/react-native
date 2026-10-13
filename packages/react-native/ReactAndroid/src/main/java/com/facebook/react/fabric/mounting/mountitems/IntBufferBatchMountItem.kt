@@ -8,6 +8,7 @@
 package com.facebook.react.fabric.mounting.mountitems
 
 import com.facebook.common.logging.FLog
+import com.facebook.react.bridge.Arguments
 import com.facebook.react.bridge.ReactMarker
 import com.facebook.react.bridge.ReactMarkerConstants
 import com.facebook.react.bridge.ReadableMap
@@ -37,9 +38,19 @@ internal class IntBufferBatchMountItem(
     private val intBuffer: IntArray,
     private val objBuffer: Array<Any?>,
     private val commitNumber: Int,
+    private val newerDirectWrites: (() -> Array<Any?>?)? = null,
 ) : BatchMountItem {
   private val intBufferLen = intBuffer.size
   private val objBufferLen = objBuffer.size
+
+  /** Replaces the values of [props] that the animation backend wrote more recently. */
+  private fun withDirectWrites(props: ReadableMap, directWrites: ReadableMap?): ReadableMap {
+    val newer = directWrites?.toHashMap()?.filterKeys(props::hasKey)
+    if (newer.isNullOrEmpty()) {
+      return props
+    }
+    return Arguments.makeNativeMap(props.toHashMap() + newer)
+  }
 
   private fun beginMarkers(reason: String) {
     Systrace.beginSection(Systrace.TRACE_TAG_REACT, "IntBufferBatchMountItem::$reason")
@@ -84,6 +95,9 @@ internal class IntBufferBatchMountItem(
     }
 
     beginMarkers("mountViews")
+    val directWrites = newerDirectWrites?.invoke()
+    var animatedView = 0
+    fun nextDirectWrites(): ReadableMap? = directWrites?.get(animatedView++) as ReadableMap?
     var i = 0
     var j = 0
     while (i < intBufferLen) {
@@ -109,7 +123,7 @@ internal class IntBufferBatchMountItem(
             surfaceMountingManager.createView(
                 fabricComponentName,
                 intBuffer[i++],
-                objBuffer[j++] as ReadableMap,
+                withDirectWrites(objBuffer[j++] as ReadableMap, nextDirectWrites()),
                 objBuffer[j++] as StateWrapper?,
                 objBuffer[j++] as EventEmitterWrapper?,
                 intBuffer[i++] == 1,
@@ -120,11 +134,15 @@ internal class IntBufferBatchMountItem(
             val tag = intBuffer[i++]
             val parentTag = intBuffer[i++]
             surfaceMountingManager.addViewAt(parentTag, tag, intBuffer[i++])
+            nextDirectWrites()?.let { surfaceMountingManager.updatePropsSynchronously(tag, it) }
           }
           INSTRUCTION_REMOVE ->
               surfaceMountingManager.removeViewAt(intBuffer[i++], intBuffer[i++], intBuffer[i++])
           INSTRUCTION_UPDATE_PROPS ->
-              surfaceMountingManager.updateProps(intBuffer[i++], objBuffer[j++] as ReadableMap)
+              surfaceMountingManager.updateProps(
+                  intBuffer[i++],
+                  withDirectWrites(objBuffer[j++] as ReadableMap, nextDirectWrites()),
+              )
           INSTRUCTION_UPDATE_STATE ->
               surfaceMountingManager.updateState(intBuffer[i++], objBuffer[j++] as StateWrapper?)
           INSTRUCTION_UPDATE_LAYOUT -> {

@@ -31,6 +31,15 @@ class MountingTransaction final {
   using Number = int64_t;
 
   /*
+   * The animation stamp number of a merged revision and the index of its first
+   * mutation.
+   */
+  struct AnimationStamp {
+    size_t firstMutation;
+    uint64_t number;
+  };
+
+  /*
    * Copying a list of `ShadowViewMutation` is expensive, so the constructor
    * accepts it as rvalue reference to discourage copying.
    */
@@ -77,6 +86,11 @@ class MountingTransaction final {
   Number getNumber() const;
 
   /*
+   * The animation stamps of the merged revisions, in mutation order.
+   */
+  const std::vector<AnimationStamp> &getAnimationStamps() const;
+
+  /*
    * Merges the given transaction in the current transaction, so they
    * can be executed atomatically as a single transaction.
    *
@@ -90,6 +104,7 @@ class MountingTransaction final {
   Number number_;
   ShadowViewMutationList mutations_;
   mutable TransactionTelemetry telemetry_;
+  std::vector<AnimationStamp> animationStamps_;
 };
 
 } // namespace facebook::react

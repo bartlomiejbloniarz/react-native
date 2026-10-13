@@ -50,7 +50,6 @@ static inline Props::Shared cloneProps(
   return newProps;
 }
 
-// Combines two mutations of the same view from one frame.
 static void mergeMutation(
     AnimationMutation& existing,
     AnimationMutation&& incoming) {
@@ -68,6 +67,26 @@ static void mergeMutation(
     }
   }
   existing.hasLayoutUpdates |= incoming.hasLayoutUpdates;
+}
+
+// Typed props set per edge or corner become raw props, which, like the
+// direct writes, set only the edges they contain.
+static void movePerEdgePropsToRawProps(AnimatedProps& animatedProps) {
+  folly::dynamic perEdgeProps = folly::dynamic::object();
+  std::erase_if(animatedProps.props, [&](const auto& animatedProp) {
+    if (!animationbackend::packsPerEdge(animatedProp->propName)) {
+      return false;
+    }
+    animationbackend::packAnimatedProp(perEdgeProps, animatedProp);
+    return true;
+  });
+  if (perEdgeProps.empty()) {
+    return;
+  }
+  auto rawProps = animatedProps.rawProps ? animatedProps.rawProps->toDynamic()
+                                         : folly::dynamic::object();
+  mergeAnimatedRawProps(rawProps, perEdgeProps);
+  animatedProps.rawProps = std::make_unique<RawProps>(std::move(rawProps));
 }
 
 AnimationBackend::AnimationBackend(
@@ -88,6 +107,8 @@ AnimationBackend::AnimationBackend(
       [weakAnimatedPropsRegistry](const ShadowTree& shadowTree) {
         if (auto animatedPropsRegistry = weakAnimatedPropsRegistry.lock()) {
           animatedPropsRegistry->initializeSurface(shadowTree.getSurfaceId());
+          shadowTree.getMountingCoordinator()->setFinalMountingOverrideDelegate(
+              animatedPropsRegistry);
         }
       };
 
@@ -95,7 +116,7 @@ AnimationBackend::AnimationBackend(
     lockedUIManager->addOnSurfaceStartCallback(initializeSurfaceContext);
     lockedUIManager->getShadowTreeRegistry().enumerate(
         [&](const ShadowTree& shadowTree, bool& /*stop*/) {
-          animatedPropsRegistry_->initializeSurface(shadowTree.getSurfaceId());
+          initializeSurfaceContext(shadowTree);
         });
   }
 }
@@ -127,24 +148,24 @@ void AnimationBackend::applySurfaceUpdates(
     std::unordered_map<Tag, AnimatedProps> directProps;
     for (auto& [tag, mutation] : updates) {
       if (mutation.hasLayoutUpdates) {
+        // Committed views are written directly too, so typed props reach
+        // platforms that mount raw props.
+        directProps.emplace(
+            tag,
+            AnimatedProps{
+                .props = {},
+                .rawProps = std::make_unique<RawProps>(
+                    animationbackend::packAnimatedProps(mutation.props))});
         layoutUpdates.emplace(tag, std::move(mutation));
       } else {
         directProps.emplace(tag, std::move(mutation.props));
       }
     }
-    if (!layoutUpdates.empty()) {
-      // A platform may re-apply a view's earlier direct writes when mounting
-      // it, so committed views are written directly too.
-      if (auto uiManager = uiManager_.lock()) {
-        for (const auto& [tag, mutation] : layoutUpdates) {
-          uiManager->synchronouslyUpdateViewOnUIThread(
-              tag, animationbackend::packAnimatedProps(mutation.props));
-        }
-      }
-      commitUpdates(surfaceId, layoutUpdates);
-    }
     if (!directProps.empty()) {
       synchronouslyUpdateProps(directProps);
+    }
+    if (!layoutUpdates.empty()) {
+      commitUpdates(surfaceId, layoutUpdates);
     }
   }
 
@@ -152,12 +173,17 @@ void AnimationBackend::applySurfaceUpdates(
 }
 
 void AnimationBackend::applyMutations(std::vector<AnimationMutations> batches) {
-  animatedPropsRegistry_->update(batches);
   std::unordered_map<SurfaceId, SurfaceUpdates> surfaceUpdates;
   std::set<SurfaceId> asyncFlushSurfaces;
   for (auto& mutations : batches) {
     unpackMutations(mutations, surfaceUpdates, asyncFlushSurfaces);
   }
+  for (auto& [_, updates] : surfaceUpdates) {
+    for (auto& [__, mutation] : updates) {
+      movePerEdgePropsToRawProps(mutation.props);
+    }
+  }
+  animatedPropsRegistry_->update(surfaceUpdates);
   applySurfaceUpdates(surfaceUpdates, asyncFlushSurfaces);
 }
 
@@ -267,19 +293,8 @@ void AnimationBackend::commitUpdates(
 
 void AnimationBackend::synchronouslyUpdateProps(
     const std::unordered_map<Tag, AnimatedProps>& updates) {
-  if (ReactNativeFeatureFlags::optimizedAnimatedPropUpdates()) {
-    if (auto uiManager = uiManager_.lock()) {
-      uiManager->synchronouslyUpdateAnimatedProps(updates);
-    }
-    return;
-  }
-  for (auto& [tag, animatedProps] : updates) {
-    // TODO: We shouldn't repack it into dynamic, but for that a rewrite
-    // of synchronouslyUpdateViewOnUIThread is needed
-    auto dyn = animationbackend::packAnimatedProps(animatedProps);
-    if (auto uiManager = uiManager_.lock()) {
-      uiManager->synchronouslyUpdateViewOnUIThread(tag, dyn);
-    }
+  if (auto uiManager = uiManager_.lock()) {
+    uiManager->synchronouslyUpdateAnimatedProps(updates);
   }
 }
 
@@ -329,6 +344,27 @@ void AnimationBackend::requestAsyncFlushForSurfaces(
         });
   }
 }
+
+std::vector<folly::dynamic> AnimationBackend::newerDirectWrites(
+    SurfaceId surfaceId,
+    const std::vector<std::pair<Tag, uint64_t>>& stampedViews) {
+  return animatedPropsRegistry_->newerDirectWrites(surfaceId, stampedViews);
+}
+
+bool AnimationBackend::hasDirectWrites(SurfaceId surfaceId) {
+  return animatedPropsRegistry_->hasDirectWrites(surfaceId);
+}
+
+#ifdef RN_SERIALIZABLE_STATE
+folly::dynamic AnimationBackend::restoreDirectWrites(
+    SurfaceId surfaceId,
+    Tag tag,
+    const Props::Shared& props,
+    const Props::Shared& preallocatedProps) {
+  return animatedPropsRegistry_->restoreDirectWrites(
+      surfaceId, tag, props, preallocatedProps);
+}
+#endif
 
 void AnimationBackend::clearRegistry(SurfaceId surfaceId) {
   animatedPropsRegistry_->clear(surfaceId);

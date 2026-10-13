@@ -5,11 +5,30 @@
  * LICENSE file in the root directory of this source tree.
  */
 
+#include <react/renderer/animationbackend/AnimatedPropsSerializer.h>
 #include <react/renderer/animationbackend/AnimationBackendCommitHook.h>
 
 #include <utility>
 
 namespace facebook::react {
+
+namespace {
+
+// The snapshot's raw props with its directly written typed props, which
+// platforms mounting raw props apply from the raw props.
+folly::dynamic rawPropsOf(const PropsSnapshot& propsSnapshot) {
+  auto rawProps = propsSnapshot.rawProps ? *propsSnapshot.rawProps
+                                         : folly::dynamic::object();
+  for (auto propName : propsSnapshot.propNames) {
+    if (animationbackend::isWrittenDirectly(propName)) {
+      rawProps.update(
+          animationbackend::packViewProp(propName, *propsSnapshot.props));
+    }
+  }
+  return rawProps;
+}
+
+} // namespace
 
 AnimationBackendCommitHook::AnimationBackendCommitHook(
     UIManager& uiManager,
@@ -29,9 +48,13 @@ RootShadowNode::Unshared AnimationBackendCommitHook::shadowTreeWillCommit(
     return newRootShadowNode;
   }
 
-  const auto& res = animatedPropsRegistry_->getMap(shadowTree.getSurfaceId());
-  auto& surfaceFamilies = res.first;
-  auto& updates = res.second;
+  auto snapshot =
+      animatedPropsRegistry_->takeStampingSnapshot(shadowTree.getSurfaceId());
+  if (auto* telemetry = TransactionTelemetry::threadLocalTelemetry()) {
+    telemetry->setAnimationStampNumber(snapshot.number);
+  }
+  const auto& surfaceFamilies = snapshot.families;
+  const auto& updates = snapshot.props;
 
   if (surfaceFamilies.empty()) {
     return newRootShadowNode;
@@ -47,26 +70,29 @@ RootShadowNode::Unshared AnimationBackendCommitHook::shadowTreeWillCommit(
             if (auto updatesIter = updates.find(shadowNode.getTag());
                 updatesIter != updates.end() &&
                 surfaceFamilies.contains(shadowNode.getFamilyShared())) {
-              auto& snapshot = updatesIter->second;
-              if (!snapshot->propNames.empty() || snapshot->rawProps) {
+              const auto& propsSnapshot = updatesIter->second;
+              if (!propsSnapshot.propNames.empty() || propsSnapshot.rawProps) {
                 PropsParserContext propsParserContext{
                     shadowNode.getSurfaceId(),
                     *shadowNode.getContextContainer()};
-                if (snapshot->rawProps) {
-                  newProps = shadowNode.getComponentDescriptor().cloneProps(
-                      propsParserContext,
-                      shadowNode.getProps(),
-                      RawProps(*snapshot->rawProps));
-                } else {
-                  newProps = shadowNode.getComponentDescriptor().cloneProps(
-                      propsParserContext, shadowNode.getProps(), {});
-                }
+                newProps = shadowNode.getComponentDescriptor().cloneProps(
+                    propsParserContext,
+                    shadowNode.getProps(),
+                    RawProps(rawPropsOf(propsSnapshot)));
                 viewProps = std::const_pointer_cast<BaseViewProps>(
                     std::static_pointer_cast<const BaseViewProps>(newProps));
               }
 
-              for (const auto& propName : snapshot->propNames) {
-                updateProp(propName, *viewProps, *snapshot);
+              for (const auto& propName : propsSnapshot.propNames) {
+                if (auto edgesIt = propsSnapshot.layoutEdges.find(propName);
+                    edgesIt != propsSnapshot.layoutEdges.end()) {
+                  for (auto edge : edgesIt->second) {
+                    updateLayoutEdge(
+                        propName, edge, *viewProps, *propsSnapshot.props);
+                  }
+                } else {
+                  updateProp(propName, *viewProps, propsSnapshot);
+                }
               }
             }
             return shadowNode.clone(

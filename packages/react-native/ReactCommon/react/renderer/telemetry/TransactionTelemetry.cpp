@@ -105,6 +105,11 @@ void TransactionTelemetry::setRevisionNumber(int revisionNumber) {
   revisionNumber_ = revisionNumber;
 }
 
+void TransactionTelemetry::setAnimationStampNumber(
+    uint64_t animationStampNumber) {
+  animationStampNumber_ = animationStampNumber;
+}
+
 TelemetryTimePoint TransactionTelemetry::getDiffStartTime() const {
   react_native_assert(diffStartTime_ != kTelemetryUndefinedTimePoint);
   react_native_assert(diffEndTime_ != kTelemetryUndefinedTimePoint);
@@ -163,6 +168,10 @@ int TransactionTelemetry::getNumberOfTextMeasurements() const {
 
 int TransactionTelemetry::getRevisionNumber() const {
   return revisionNumber_;
+}
+
+uint64_t TransactionTelemetry::getAnimationStampNumber() const {
+  return animationStampNumber_;
 }
 
 int TransactionTelemetry::getAffectedLayoutNodesCount() const {

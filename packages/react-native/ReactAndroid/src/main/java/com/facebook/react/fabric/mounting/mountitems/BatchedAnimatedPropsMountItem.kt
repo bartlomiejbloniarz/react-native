@@ -12,7 +12,6 @@ import com.facebook.react.bridge.JavaOnlyArray
 import com.facebook.react.bridge.JavaOnlyMap
 import com.facebook.react.bridge.ReadableMap
 import com.facebook.react.fabric.FabricUIManager.IS_DEVELOPMENT_ENVIRONMENT
-import com.facebook.react.fabric.mounting.MountItemDispatcher
 import com.facebook.react.fabric.mounting.MountingManager
 import com.facebook.react.uimanager.ViewProps
 
@@ -20,15 +19,13 @@ internal class BatchedAnimatedPropsMountItem(
     private val intBuffer: IntArray,
     private val doubleBuffer: DoubleArray,
     private val rawPropsBuffer: Array<Any?>,
-    private val mountItemDispatcher: MountItemDispatcher,
 ) : MountItem {
 
   override fun execute(mountingManager: MountingManager) {
     decode { viewTag, props ->
       try {
-        if (!mountingManager.updateAnimatedPropsSynchronously(viewTag, props)) {
-          mountItemDispatcher.addMountItem(SynchronousMountItem(viewTag, props))
-        }
+        // A view that does not exist yet gets these props when it is created.
+        mountingManager.updatePropsSynchronously(viewTag, props)
       } catch (ex: Exception) {
         // Match SynchronousMountItem's handling of view-manager failures.
       }

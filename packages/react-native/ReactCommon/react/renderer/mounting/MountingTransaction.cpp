@@ -19,7 +19,8 @@ MountingTransaction::MountingTransaction(
     : surfaceId_(surfaceId),
       number_(number),
       mutations_(std::move(mutations)),
-      telemetry_(std::move(telemetry)) {}
+      telemetry_(std::move(telemetry)),
+      animationStamps_{{0, telemetry_.getAnimationStampNumber()}} {}
 
 const ShadowViewMutationList& MountingTransaction::getMutations() const& {
   return mutations_;
@@ -41,9 +42,18 @@ Number MountingTransaction::getNumber() const {
   return number_;
 }
 
+const std::vector<MountingTransaction::AnimationStamp>&
+MountingTransaction::getAnimationStamps() const {
+  return animationStamps_;
+}
+
 void MountingTransaction::mergeWith(MountingTransaction&& transaction) {
   react_native_assert(transaction.getSurfaceId() == surfaceId_);
   number_ = transaction.getNumber();
+  for (const auto& stamp : transaction.animationStamps_) {
+    animationStamps_.push_back(
+        {mutations_.size() + stamp.firstMutation, stamp.number});
+  }
   mutations_.insert(
       mutations_.end(),
       std::make_move_iterator(transaction.mutations_.begin()),

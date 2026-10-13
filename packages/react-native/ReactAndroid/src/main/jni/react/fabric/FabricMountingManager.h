@@ -21,12 +21,15 @@ namespace facebook::react {
 struct AnimatedProps;
 
 class MountingTransaction;
+class UIManager;
 
 class FabricMountingManager final {
  public:
   FabricMountingManager(jni::global_ref<JFabricUIManager::javaobject> &javaUIManager);
   FabricMountingManager(const FabricMountingManager &) = delete;
   ~FabricMountingManager();
+
+  void setUIManager(std::weak_ptr<UIManager> uiManager);
 
   void onSurfaceStart(SurfaceId surfaceId);
 
@@ -105,6 +108,8 @@ class FabricMountingManager final {
 
   jni::global_ref<JFabricUIManager::javaobject> javaUIManager_;
 
+  std::weak_ptr<UIManager> uiManager_;
+
   std::recursive_mutex commitMutex_;
 
   /*
@@ -126,8 +131,9 @@ class FabricMountingManager final {
 
   struct AllocatedView {
     /*
-     * With enablePreallocatedPropsDiffOnInsertAndroid, the props the view was
-     * preallocated with, until its first Insert. nullptr otherwise.
+     * With enablePreallocatedPropsDiffOnInsertAndroid or
+     * useSharedAnimatedBackend, the props the view was preallocated with,
+     * until its first Insert. nullptr otherwise.
      */
     Props::Shared preallocatedProps;
     AllocatedViewState state;

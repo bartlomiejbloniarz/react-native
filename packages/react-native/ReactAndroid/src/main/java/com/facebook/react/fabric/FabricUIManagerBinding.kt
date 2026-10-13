@@ -59,6 +59,12 @@ internal class FabricUIManagerBinding : HybridClassBase() {
 
   external fun getRelativeAncestorList(rootTag: Int, childTag: Int): IntArray
 
+  external fun newerDirectWrites(
+      surfaceId: Int,
+      animatedViews: IntArray,
+      animationStamps: LongArray,
+  ): Array<Any?>?
+
   external fun stopSurface(surfaceId: Int)
 
   external fun stopSurfaceWithSurfaceHandler(surfaceHandler: SurfaceHandlerBinding)

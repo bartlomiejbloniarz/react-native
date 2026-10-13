@@ -416,6 +416,13 @@ folly::dynamic AndroidTextInputProps::getDiffProps(
     }
   }
 
+  if (textAttributes.foregroundColor !=
+      oldProps->textAttributes.foregroundColor) {
+    result["color"] = textAttributes.foregroundColor
+        ? folly::dynamic(*textAttributes.foregroundColor)
+        : folly::dynamic(nullptr);
+  }
+
   // Base text input props
   if (defaultValue != oldProps->defaultValue) {
     result["defaultValue"] = defaultValue;

@@ -141,6 +141,11 @@ class FabricUIManagerBinding : public jni::HybridClass<FabricUIManagerBinding>,
 
   jintArray getRelativeAncestorList(jint rootTag, jint childTag);
 
+  jni::local_ref<jni::JArrayClass<jobject>> newerDirectWrites(
+      jint surfaceId,
+      jni::alias_ref<jni::JArrayInt> animatedViews,
+      jni::alias_ref<jni::JArrayLong> animationStamps);
+
   void uninstallFabricUIManager();
 
   // Private member variables

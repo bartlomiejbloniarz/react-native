@@ -1255,6 +1255,7 @@ class facebook::react::FabricMountingManager {
   public void scheduleReactRevisionMerge(facebook::react::SurfaceId surfaceId);
   public void sendAccessibilityEvent(const facebook::react::ShadowView& shadowView, const std::string& eventType);
   public void setIsJSResponder(const facebook::react::ShadowView& shadowView, bool isJSResponder, bool blockNativeResponder);
+  public void setUIManager(std::weak_ptr<facebook::react::UIManager> uiManager);
   public void setViewSnapshot(facebook::react::Tag sourceTag, facebook::react::Tag targetTag, facebook::react::SurfaceId surfaceId);
   public void synchronouslyUpdateAnimatedProps(const std::unordered_map<facebook::react::Tag, facebook::react::AnimatedProps>& updates);
   public void synchronouslyUpdateViewOnUIThread(facebook::react::Tag viewTag, const folly::dynamic& props);
@@ -1334,6 +1335,10 @@ class facebook::react::HostPlatformViewProps : public facebook::react::BaseViewP
   public bool renderToHardwareTextureAndroid;
   public bool screenReaderFocusable;
   public facebook::react::Float elevation;
+  public std::optional<facebook::react::Float> scaleX;
+  public std::optional<facebook::react::Float> scaleY;
+  public std::optional<facebook::react::Float> translateX;
+  public std::optional<facebook::react::Float> translateY;
   public std::optional<facebook::react::NativeDrawable> nativeBackground;
   public std::optional<facebook::react::NativeDrawable> nativeForeground;
   public std::optional<int> nextFocusDown;
@@ -3187,6 +3192,8 @@ struct facebook::react::CppMountItem {
   public facebook::react::ShadowView newChildShadowView;
   public facebook::react::ShadowView oldChildShadowView;
   public facebook::react::Tag parentTag;
+  public folly::dynamic restoredValues;
+  public int animationStampIndex;
   public int index;
   public static facebook::react::CppMountItem CreateMountItem(const facebook::react::ShadowView& shadowView);
   public static facebook::react::CppMountItem DeleteMountItem(const facebook::react::ShadowView& shadowView);

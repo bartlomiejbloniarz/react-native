@@ -643,7 +643,9 @@ class facebook::react::AnimationBackend : public facebook::react::UIManagerAnima
   public AnimationBackend(std::shared_ptr<facebook::react::AnimationChoreographer> animationChoreographer, std::shared_ptr<facebook::react::UIManager> uiManager);
   public using PauseCallback = std::function<void()>;
   public using ResumeCallback = std::function<void()>;
+  public virtual bool hasDirectWrites(facebook::react::SurfaceId surfaceId) override;
   public virtual facebook::react::CallbackId start(const facebook::react::UIManagerAnimationBackend::Callback& callback) override;
+  public virtual std::vector<folly::dynamic> newerDirectWrites(facebook::react::SurfaceId surfaceId, const std::vector<std::pair<facebook::react::Tag, uint64_t>>& stampedViews) override;
   public virtual void clearRegistry(facebook::react::SurfaceId surfaceId) override;
   public virtual void clearRegistryOnSurfaceStop(facebook::react::SurfaceId surfaceId) override;
   public virtual void onAnimationFrame(facebook::react::AnimationTimestamp timestamp) override;
@@ -1669,6 +1671,7 @@ class facebook::react::MountingCoordinator {
   public facebook::react::SurfaceId getSurfaceId() const;
   public std::optional<facebook::react::MountingTransaction> pullTransaction(bool willPerformAsynchronously = false) const;
   public void didPerformAsyncTransactions() const;
+  public void setFinalMountingOverrideDelegate(std::weak_ptr<const facebook::react::MountingOverrideDelegate> delegate) const;
   public void setMountingOverrideDelegate(std::weak_ptr<const facebook::react::MountingOverrideDelegate> delegate) const;
 }
 
@@ -1683,6 +1686,7 @@ class facebook::react::MountingTransaction {
   public MountingTransaction(facebook::react::MountingTransaction&& mountingTransaction) noexcept = default;
   public MountingTransaction(facebook::react::SurfaceId surfaceId, facebook::react::MountingTransaction::Number number, facebook::react::ShadowViewMutationList&& mutations, facebook::react::TransactionTelemetry telemetry);
   public const facebook::react::ShadowViewMutationList& getMutations() const;
+  public const std::vector<facebook::react::MountingTransaction::AnimationStamp>& getAnimationStamps() const;
   public facebook::react::MountingTransaction& operator=(const facebook::react::MountingTransaction& other) = delete;
   public facebook::react::MountingTransaction& operator=(facebook::react::MountingTransaction&& other) = default;
   public facebook::react::MountingTransaction::Number getNumber() const;
@@ -1691,6 +1695,11 @@ class facebook::react::MountingTransaction {
   public facebook::react::TransactionTelemetry& getTelemetry() const;
   public using Number = int64_t;
   public void mergeWith(facebook::react::MountingTransaction&& transaction);
+}
+
+struct facebook::react::MountingTransaction::AnimationStamp {
+  public size_t firstMutation;
+  public uint64_t number;
 }
 
 class facebook::react::NativeAnimatedNodesManager : public std::enable_shared_from_this<facebook::react::NativeAnimatedNodesManager> {
@@ -2612,12 +2621,14 @@ class facebook::react::TransactionTelemetry {
   public int getNumberOfTextMeasurements() const;
   public int getRevisionNumber() const;
   public static facebook::react::TransactionTelemetry* threadLocalTelemetry();
+  public uint64_t getAnimationStampNumber() const;
   public void didCommit();
   public void didDiff();
   public void didLayout();
   public void didLayout(int affectedLayoutNodesCount);
   public void didMeasureText();
   public void didMount();
+  public void setAnimationStampNumber(uint64_t animationStampNumber);
   public void setAsThreadLocal();
   public void setRevisionNumber(int revisionNumber);
   public void unsetAsThreadLocal();
@@ -2709,7 +2720,10 @@ class facebook::react::UIManager : public facebook::react::ShadowTreeDelegate {
 
 class facebook::react::UIManagerAnimationBackend {
   public using Callback = std::function<facebook::react::AnimationMutations(facebook::react::AnimationTimestamp)>;
+  public virtual bool hasDirectWrites(facebook::react::SurfaceId);
   public virtual facebook::react::CallbackId start(const facebook::react::UIManagerAnimationBackend::Callback& callback) = 0;
+  public virtual folly::dynamic restoreDirectWrites(facebook::react::SurfaceId, facebook::react::Tag, const facebook::react::Props::Shared&, const facebook::react::Props::Shared&);
+  public virtual std::vector<folly::dynamic> newerDirectWrites(facebook::react::SurfaceId, const std::vector<std::pair<facebook::react::Tag, uint64_t>>&);
   public virtual void clearRegistry(facebook::react::SurfaceId surfaceId) = 0;
   public virtual void clearRegistryOnSurfaceStop(facebook::react::SurfaceId surfaceId) = 0;
   public virtual void onAnimationFrame(facebook::react::AnimationTimestamp timestamp) = 0;

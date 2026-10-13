@@ -316,15 +316,8 @@ ShadowTree::Unique UIManager::stopSurface(SurfaceId surfaceId) const {
     }
   }
 
-  if (ReactNativeFeatureFlags::useSharedAnimatedBackend()) {
-    runtimeExecutor_(
-        [surfaceId,
-         animationBackendWeak = std::weak_ptr<UIManagerAnimationBackend>(
-             animationBackend_)](jsi::Runtime& /*runtime*/) {
-          if (auto animationBackend = animationBackendWeak.lock()) {
-            animationBackend->clearRegistryOnSurfaceStop(surfaceId);
-          }
-        });
+  if (animationBackend_ != nullptr) {
+    animationBackend_->clearRegistryOnSurfaceStop(surfaceId);
   }
 
   return shadowTree;

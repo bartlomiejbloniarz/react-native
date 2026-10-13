@@ -120,6 +120,10 @@ std::optional<MountingTransaction> MountingCoordinator::pullTransaction(
         telemetry = transaction->getTelemetry();
       } else {
         number_++;
+        const auto& coveringRevision =
+            lastRevision_.has_value() ? *lastRevision_ : baseRevision_;
+        telemetry.setAnimationStampNumber(
+            coveringRevision.telemetry.getAnimationStampNumber());
         telemetry.willLayout();
         telemetry.didLayout();
         telemetry.willCommit();
@@ -134,6 +138,19 @@ std::optional<MountingTransaction> MountingCoordinator::pullTransaction(
       didOverridePullTransaction = true;
 #endif
     }
+  }
+
+  auto finalDelegate = finalMountingOverrideDelegate_.lock();
+  if (transaction.has_value() && finalDelegate &&
+      finalDelegate->shouldOverridePullTransaction()) {
+    transaction = finalDelegate->pullTransaction(
+        surfaceId_,
+        transaction->getNumber(),
+        transaction->getTelemetry(),
+        transaction->getMutations());
+#ifdef RN_SHADOW_TREE_INTROSPECTION
+    didOverridePullTransaction = true;
+#endif
   }
 
 #ifdef RN_SHADOW_TREE_INTROSPECTION
@@ -219,6 +236,12 @@ void MountingCoordinator::setMountingOverrideDelegate(
   std::scoped_lock lock(mutex_);
   mountingOverrideDelegates_.insert(
       mountingOverrideDelegates_.end(), std::move(delegate));
+}
+
+void MountingCoordinator::setFinalMountingOverrideDelegate(
+    std::weak_ptr<const MountingOverrideDelegate> delegate) const {
+  std::scoped_lock lock(mutex_);
+  finalMountingOverrideDelegate_ = std::move(delegate);
 }
 
 } // namespace facebook::react

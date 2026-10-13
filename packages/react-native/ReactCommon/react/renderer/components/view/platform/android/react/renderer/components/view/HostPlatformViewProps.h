@@ -52,6 +52,12 @@ class HostPlatformViewProps : public BaseViewProps {
   std::optional<int> nextFocusRight{};
   std::optional<int> nextFocusUp{};
 
+  // Legacy transform props, set without `transform`.
+  std::optional<Float> scaleX{};
+  std::optional<Float> scaleY{};
+  std::optional<Float> translateX{};
+  std::optional<Float> translateY{};
+
 #pragma mark - Convenience Methods
 
   bool getProbablyMoreHorizontalThanVertical_DEPRECATED() const;

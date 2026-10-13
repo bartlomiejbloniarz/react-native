@@ -23,6 +23,7 @@
 #include <react/renderer/mounting/MountingTransaction.h>
 #include <react/renderer/mounting/ShadowView.h>
 #include <react/renderer/mounting/ShadowViewMutation.h>
+#include <react/renderer/uimanager/UIManager.h>
 
 #include <fbjni/fbjni.h>
 #include <glog/logging.h>
@@ -42,6 +43,10 @@ FabricMountingManager::~FabricMountingManager() {
   // Manually reset `javaUIManager_` since FabricMountingManager may be retained
   // from a GC thread (destroyUnmountedShadowNode)
   jni::ThreadScope::WithClassLoader([&]() { javaUIManager_.reset(); });
+}
+
+void FabricMountingManager::setUIManager(std::weak_ptr<UIManager> uiManager) {
+  uiManager_ = std::move(uiManager);
 }
 
 void FabricMountingManager::onSurfaceStart(SurfaceId surfaceId) {
@@ -321,7 +326,7 @@ bool shouldDiffInsertPropsAgainstPreallocatedProps() {
       ReactNativeFeatureFlags::enablePreallocatedPropsDiffOnInsertAndroid();
 }
 
-jni::local_ref<jobject> getProps(
+folly::dynamic getPropsPayload(
     const ShadowView& oldShadowView,
     const ShadowView& newShadowView) {
   // We calculate the diffing between the props of the last mounted ShadowTree
@@ -356,17 +361,23 @@ jni::local_ref<jobject> getProps(
     }
 #endif
 
-    return ReadableNativeMap::newObjectCxxArgs(std::move(diff));
+    return diff;
   }
   if (ReactNativeFeatureFlags::enableAccumulatedUpdatesInRawPropsAndroid()) {
     if (oldProps == nullptr) {
-      return ReadableNativeMap::newObjectCxxArgs(newProps->rawProps);
+      return newProps->rawProps;
     } else {
-      return ReadableNativeMap::newObjectCxxArgs(
-          diffDynamicProps(oldProps->rawProps, newProps->rawProps));
+      return diffDynamicProps(oldProps->rawProps, newProps->rawProps);
     }
   }
-  return ReadableNativeMap::newObjectCxxArgs(newProps->rawProps);
+  return newProps->rawProps;
+}
+
+jni::local_ref<jobject> getProps(
+    const ShadowView& oldShadowView,
+    const ShadowView& newShadowView) {
+  return ReadableNativeMap::newObjectCxxArgs(
+      getPropsPayload(oldShadowView, newShadowView));
 }
 
 struct InstructionBuffer {
@@ -377,6 +388,11 @@ struct InstructionBuffer {
 
   std::vector<jint> ints;
   jni::local_ref<jni::JArrayClass<jobject>> objects;
+  // Tag and animation stamp index of each CREATE, INSERT and UPDATE_PROPS
+  // instruction, in instruction order.
+  std::vector<jint> animatedViews;
+  bool collectsAnimatedViews =
+      ReactNativeFeatureFlags::useSharedAnimatedBackend();
 
   int objectsPosition = 0;
 
@@ -387,6 +403,14 @@ struct InstructionBuffer {
   template <size_t N>
   inline void writeIntArray(const std::array<int, N>& buffer) {
     ints.insert(ints.end(), buffer.begin(), buffer.end());
+  }
+
+  inline void writeAnimatedView(const CppMountItem& mountItem) {
+    if (!collectsAnimatedViews) {
+      return;
+    }
+    animatedViews.push_back(mountItem.newChildShadowView.tag);
+    animatedViews.push_back(mountItem.animationStampIndex);
   }
 
   inline void writeObject(jobject obj) {
@@ -420,6 +444,7 @@ inline void writeMountItemPreamble(
 inline void writeCreateMountItem(
     InstructionBuffer& buffer,
     const CppMountItem& mountItem) {
+  buffer.writeAnimatedView(mountItem);
   int isLayoutable =
       mountItem.newChildShadowView.layoutMetrics != EmptyLayoutMetrics ? 1 : 0;
   buffer.writeIntArray(
@@ -461,6 +486,7 @@ inline void writeDeleteMountItem(
 inline void writeInsertMountItem(
     InstructionBuffer& buffer,
     const CppMountItem& mountItem) {
+  buffer.writeAnimatedView(mountItem);
   buffer.writeIntArray(
       std::array<int, 3>{
           mountItem.newChildShadowView.tag,
@@ -481,10 +507,23 @@ inline void writeRemoveMountItem(
 inline void writeUpdatePropsMountItem(
     InstructionBuffer& buffer,
     const CppMountItem& mountItem) {
+  buffer.writeAnimatedView(mountItem);
   buffer.writeInt(mountItem.newChildShadowView.tag);
+  if (mountItem.restoredValues == nullptr) {
+    buffer.writeObject(
+        getProps(mountItem.oldChildShadowView, mountItem.newChildShadowView)
+            .get());
+    return;
+  }
+  // An item whose props did not change only restores values.
+  auto props =
+      mountItem.oldChildShadowView.props == mountItem.newChildShadowView.props
+      ? folly::dynamic::object()
+      : getPropsPayload(
+            mountItem.oldChildShadowView, mountItem.newChildShadowView);
+  props.update(mountItem.restoredValues);
   buffer.writeObject(
-      getProps(mountItem.oldChildShadowView, mountItem.newChildShadowView)
-          .get());
+      ReadableNativeMap::newObjectCxxArgs(std::move(props)).get());
 }
 
 inline void writeUpdateStateMountItem(
@@ -636,7 +675,26 @@ void FabricMountingManager::executeMount(
                  << " was stopped!";
     }
 
-    for (const auto& mutation : mutations) {
+    auto uiManager = uiManager_.lock();
+    auto animationBackend =
+        ReactNativeFeatureFlags::useSharedAnimatedBackend() &&
+            uiManager != nullptr
+        ? uiManager->unstable_getAnimationBackend().lock()
+        : nullptr;
+    const auto& animationStamps = transaction.getAnimationStamps();
+    size_t animationStampIndex = 0;
+    auto inAnimationStamp = [&](CppMountItem mountItem) {
+      mountItem.animationStampIndex = static_cast<int>(animationStampIndex);
+      return mountItem;
+    };
+    for (size_t mutationIndex = 0; mutationIndex < mutations.size();
+         mutationIndex++) {
+      while (animationStampIndex + 1 < animationStamps.size() &&
+             animationStamps[animationStampIndex + 1].firstMutation <=
+                 mutationIndex) {
+        animationStampIndex++;
+      }
+      const auto& mutation = mutations[mutationIndex];
       auto parentTag = mutation.parentTag;
       const auto& oldChildShadowView = mutation.oldChildShadowView;
       const auto& newChildShadowView = mutation.newChildShadowView;
@@ -654,8 +712,8 @@ void FabricMountingManager::executeMount(
                       .state = AllocatedViewState::Mounted});
 
           if (shouldCreateView) {
-            cppCommonMountItems.push_back(
-                CppMountItem::CreateMountItem(newChildShadowView));
+            cppCommonMountItems.push_back(inAnimationStamp(
+                CppMountItem::CreateMountItem(newChildShadowView)));
           } else {
             allocatedView->second.state = AllocatedViewState::Mounted;
           }
@@ -688,9 +746,9 @@ void FabricMountingManager::executeMount(
             if (oldChildShadowView.props != newChildShadowView.props) {
               (maintainMutationOrder ? cppCommonMountItems
                                      : cppUpdatePropsMountItems)
-                  .push_back(
+                  .push_back(inAnimationStamp(
                       CppMountItem::UpdatePropsMountItem(
-                          oldChildShadowView, newChildShadowView));
+                          oldChildShadowView, newChildShadowView)));
             }
             if (oldChildShadowView.state != newChildShadowView.state) {
               (maintainMutationOrder ? cppCommonMountItems
@@ -757,12 +815,19 @@ void FabricMountingManager::executeMount(
         case ShadowViewMutation::Insert: {
           if (!isVirtual) {
             // Insert item
-            cppCommonMountItems.push_back(
+            cppCommonMountItems.push_back(inAnimationStamp(
                 CppMountItem::InsertMountItem(
-                    parentTag, newChildShadowView, index));
+                    parentTag, newChildShadowView, index)));
 
             auto allocatedView = allocatedViewTags.find(newChildShadowView.tag);
             bool shouldCreateView = allocatedView == allocatedViewTags.end();
+            auto preallocationProps = shouldCreateView
+                ? nullptr
+                : allocatedView->second.preallocatedProps;
+            auto& propsMountItems = maintainMutationOrder
+                ? cppCommonMountItems
+                : cppUpdatePropsMountItems;
+            auto propsMountItemCount = propsMountItems.size();
             if (ReactNativeFeatureFlags::
                     enableAccumulatedUpdatesInRawPropsAndroid()) {
               if (shouldCreateView) {
@@ -773,9 +838,9 @@ void FabricMountingManager::executeMount(
                   !shouldDiffInsertPropsAgainstPreallocatedProps()) {
                 (maintainMutationOrder ? cppCommonMountItems
                                        : cppUpdatePropsMountItems)
-                    .push_back(
+                    .push_back(inAnimationStamp(
                         CppMountItem::UpdatePropsMountItem(
-                            {}, newChildShadowView));
+                            {}, newChildShadowView)));
               } else if (auto& preallocatedProps =
                              allocatedView->second.preallocatedProps;
                          preallocatedProps != nullptr) {
@@ -784,9 +849,9 @@ void FabricMountingManager::executeMount(
                   preallocatedShadowView.props = preallocatedProps;
                   (maintainMutationOrder ? cppCommonMountItems
                                          : cppUpdatePropsMountItems)
-                      .push_back(
+                      .push_back(inAnimationStamp(
                           CppMountItem::UpdatePropsMountItem(
-                              preallocatedShadowView, newChildShadowView));
+                              preallocatedShadowView, newChildShadowView)));
                 }
                 preallocatedProps = nullptr;
               }
@@ -796,10 +861,33 @@ void FabricMountingManager::executeMount(
                            << newChildShadowView.tag;
                 (maintainMutationOrder ? cppCommonMountItems
                                        : cppUpdatePropsMountItems)
-                    .push_back(
+                    .push_back(inAnimationStamp(
                         CppMountItem::UpdatePropsMountItem(
-                            {}, newChildShadowView));
+                            {}, newChildShadowView)));
               }
+            }
+
+            if (animationBackend != nullptr) {
+              auto restoredValues = animationBackend->restoreDirectWrites(
+                  surfaceId,
+                  newChildShadowView.tag,
+                  newChildShadowView.props,
+                  preallocationProps);
+              if (!restoredValues.empty()) {
+                if (propsMountItems.size() > propsMountItemCount) {
+                  propsMountItems.back().restoredValues =
+                      std::move(restoredValues);
+                } else {
+                  auto mountItem = inAnimationStamp(
+                      CppMountItem::UpdatePropsMountItem(
+                          newChildShadowView, newChildShadowView));
+                  mountItem.restoredValues = std::move(restoredValues);
+                  propsMountItems.push_back(std::move(mountItem));
+                }
+              }
+            }
+            if (!shouldCreateView) {
+              allocatedView->second.preallocatedProps = nullptr;
             }
 
             // State
@@ -1044,11 +1132,33 @@ void FabricMountingManager::executeMount(
   env->SetIntArrayRegion(
       ints, 0, static_cast<jsize>(buffer.ints.size()), buffer.ints.data());
 
+  jni::local_ref<jni::JArrayInt> animatedViews = nullptr;
+  jni::local_ref<jni::JArrayLong> animationStamps = nullptr;
+  if (ReactNativeFeatureFlags::useSharedAnimatedBackend() &&
+      !buffer.animatedViews.empty()) {
+    animatedViews = jni::JArrayInt::newArray(buffer.animatedViews.size());
+    animatedViews->setRegion(
+        0,
+        static_cast<jsize>(buffer.animatedViews.size()),
+        buffer.animatedViews.data());
+    std::vector<jlong> stampNumbers;
+    for (const auto& stamp : transaction.getAnimationStamps()) {
+      stampNumbers.push_back(static_cast<jlong>(stamp.number));
+    }
+    animationStamps = jni::JArrayLong::newArray(stampNumbers.size());
+    animationStamps->setRegion(
+        0, static_cast<jsize>(stampNumbers.size()), stampNumbers.data());
+  }
+
   static auto createMountItemsIntBufferBatchContainer =
       JFabricUIManager::javaClassStatic()
           ->getMethod<jni::alias_ref<JMountItem>(
-              jint, jintArray, jni::jtypeArray<jobject>, jint)>(
-              "createIntBufferBatchMountItem");
+              jint,
+              jintArray,
+              jni::jtypeArray<jobject>,
+              jint,
+              jintArray,
+              jlongArray)>("createIntBufferBatchMountItem");
   auto batch = createMountItemsIntBufferBatchContainer(
       javaUIManager_,
       surfaceId,
@@ -1056,7 +1166,9 @@ void FabricMountingManager::executeMount(
       // object through the JNI
       batchMountItemIntsSize > 0 ? ints : nullptr,
       batchMountItemObjectsSize > 0 ? buffer.objects.get() : nullptr,
-      revisionNumber);
+      revisionNumber,
+      animatedViews != nullptr ? animatedViews.get() : nullptr,
+      animationStamps != nullptr ? animationStamps.get() : nullptr);
 
   auto finishTransactionEndTime = telemetryTimePointNow();
 
@@ -1102,7 +1214,9 @@ void FabricMountingManager::drainPreallocateViewsQueue() {
                   shadowView.tag,
                   AllocatedView{
                       .preallocatedProps =
-                          shouldDiffInsertPropsAgainstPreallocatedProps()
+                          shouldDiffInsertPropsAgainstPreallocatedProps() ||
+                              ReactNativeFeatureFlags::
+                                  useSharedAnimatedBackend()
                           ? shadowView.props
                           : nullptr,
                       .state = AllocatedViewState::Preallocated})

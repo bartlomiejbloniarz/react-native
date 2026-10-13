@@ -95,6 +95,22 @@ HostPlatformViewProps::HostPlatformViewProps(
           rawProps,
           "nextFocusUp",
           sourceProps.nextFocusUp,
+          {})),
+      scaleX(
+          convertRawProp(context, rawProps, "scaleX", sourceProps.scaleX, {})),
+      scaleY(
+          convertRawProp(context, rawProps, "scaleY", sourceProps.scaleY, {})),
+      translateX(convertRawProp(
+          context,
+          rawProps,
+          "translateX",
+          sourceProps.translateX,
+          {})),
+      translateY(convertRawProp(
+          context,
+          rawProps,
+          "translateY",
+          sourceProps.translateY,
           {})) {}
 
 void HostPlatformViewProps::setProp(
@@ -122,6 +138,10 @@ void HostPlatformViewProps::setProp(
     RAW_SET_PROP_SWITCH_CASE_BASIC(nextFocusLeft);
     RAW_SET_PROP_SWITCH_CASE_BASIC(nextFocusRight);
     RAW_SET_PROP_SWITCH_CASE_BASIC(nextFocusUp);
+    RAW_SET_PROP_SWITCH_CASE_BASIC(scaleX);
+    RAW_SET_PROP_SWITCH_CASE_BASIC(scaleY);
+    RAW_SET_PROP_SWITCH_CASE_BASIC(translateX);
+    RAW_SET_PROP_SWITCH_CASE_BASIC(translateY);
   }
 }
 
@@ -1050,6 +1070,22 @@ folly::dynamic HostPlatformViewProps::getDiffProps(
     } else {
       result["nextFocusUp"] = folly::dynamic(nullptr);
     }
+  }
+
+  if (scaleX != oldProps->scaleX) {
+    result["scaleX"] = scaleX.value_or(1);
+  }
+
+  if (scaleY != oldProps->scaleY) {
+    result["scaleY"] = scaleY.value_or(1);
+  }
+
+  if (translateX != oldProps->translateX) {
+    result["translateX"] = translateX.value_or(0);
+  }
+
+  if (translateY != oldProps->translateY) {
+    result["translateY"] = translateY.value_or(0);
   }
 
   return result;

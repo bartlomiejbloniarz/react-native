@@ -46,9 +46,9 @@ This is the heart of the backend. This component is responsible for managing
 user-provided callbacks, segregating props, and applying them per view: through
 a Fabric commit performed on the main thread for views with layout updates, and
 through the `synchronouslyUpdateProps` path for the rest. Views with layout
-updates also have their non-layout props written synchronously, and their typed
-layout props are left to the commit. This component is exposed through
-`UIManager` with the `UIManagerAnimationBackend` interface.
+updates also have their non-layout props written synchronously, before the
+commit, and their typed layout props are left to the commit. This component is
+exposed through `UIManager` with the `UIManagerAnimationBackend` interface.
 
 ### AnimatedProps
 
@@ -77,6 +77,16 @@ value from the registry. Since the commit hook runs on React commits, it is safe
 for it to use RSNRU to propagate these updates to React. After the commit hook
 runs, we clear the registry. If the prop is not explicitly changed by the user
 in a render, it will remain unchanged by React on subsequent rerenders.
+
+Every frame has a write number, and the registry records the props each frame
+wrote directly to a view with that number. A React commit is stamped with the
+number of the last frame its props include, and the stamp travels with the
+revision to its mount. When a mount sets a prop that a later frame wrote
+directly, the written value wins: on Android when the mount batch executes, and
+on other platforms in the last `MountingOverrideDelegate` of the pull. When a
+view with records is inserted on Android, its recorded props are also sent with
+React's values, so a view written to before its insertion shows the mounted
+values.
 
 Additionally, in the callback registered in `start`, one can return a list of
 surfaces that should perform a commit on the JS thread, to have the RSNRU

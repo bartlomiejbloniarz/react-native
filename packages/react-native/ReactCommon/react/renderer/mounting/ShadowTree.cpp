@@ -26,6 +26,33 @@ namespace facebook::react {
 namespace {
 const int MAX_COMMIT_ATTEMPTS_BEFORE_LOCKING = 3;
 
+// Makes `telemetry` the thread's telemetry while it exists, then restores the
+// telemetry of the commit this one runs in, if any.
+class ThreadLocalTelemetryScope {
+ public:
+  explicit ThreadLocalTelemetryScope(TransactionTelemetry& telemetry)
+      : telemetry_(telemetry),
+        outerTelemetry_(TransactionTelemetry::threadLocalTelemetry()) {
+    telemetry_.setAsThreadLocal();
+  }
+
+  ~ThreadLocalTelemetryScope() {
+    if (outerTelemetry_ != nullptr) {
+      outerTelemetry_->setAsThreadLocal();
+    } else {
+      telemetry_.unsetAsThreadLocal();
+    }
+  }
+
+  ThreadLocalTelemetryScope(const ThreadLocalTelemetryScope&) = delete;
+  ThreadLocalTelemetryScope& operator=(const ThreadLocalTelemetryScope&) =
+      delete;
+
+ private:
+  TransactionTelemetry& telemetry_;
+  TransactionTelemetry* outerTelemetry_;
+};
+
 std::string getShadowTreeCommitSourceName(ShadowTreeCommitSource source) {
   switch (source) {
     case ShadowTreeCommitSource::Unknown:
@@ -398,9 +425,16 @@ CommitStatus ShadowTree::tryCommit(
         commitOptions);
   }
 
-  // Run commit hooks.
-  newRootShadowNode = delegate_.shadowTreeWillCommit(
-      *this, oldRootShadowNode, newRootShadowNode, commitOptions);
+  // Run commit hooks. A hook that stamps animated props into the new root
+  // sets the revision's stamp number on the thread-local telemetry; otherwise
+  // the revision carries the stamp of the one it is built on.
+  telemetry.setAnimationStampNumber(
+      oldRevision.telemetry.getAnimationStampNumber());
+  {
+    ThreadLocalTelemetryScope telemetryScope{telemetry};
+    newRootShadowNode = delegate_.shadowTreeWillCommit(
+        *this, oldRootShadowNode, newRootShadowNode, commitOptions);
+  }
 
   if (!newRootShadowNode) {
     return CommitStatus::Cancelled;
@@ -411,13 +445,12 @@ CommitStatus ShadowTree::tryCommit(
   affectedLayoutableNodes.reserve(1024);
 
   telemetry.willLayout();
-  telemetry.setAsThreadLocal();
   {
+    ThreadLocalTelemetryScope telemetryScope{telemetry};
     jsinspector_modern::tracing::PerformanceTracerSection s2(
         "layout", "Renderer", "\u269b Native");
     newRootShadowNode->layoutIfNeeded(&affectedLayoutableNodes);
   }
-  telemetry.unsetAsThreadLocal();
   telemetry.didLayout(static_cast<int>(affectedLayoutableNodes.size()));
 
   {

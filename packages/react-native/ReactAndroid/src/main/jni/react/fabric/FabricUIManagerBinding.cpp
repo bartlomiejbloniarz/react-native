@@ -310,6 +310,39 @@ jint FabricUIManagerBinding::findNextFocusableElement(
   return nextNode->getTag();
 }
 
+jni::local_ref<jni::JArrayClass<jobject>>
+FabricUIManagerBinding::newerDirectWrites(
+    jint surfaceId,
+    jni::alias_ref<jni::JArrayInt> animatedViews,
+    jni::alias_ref<jni::JArrayLong> animationStamps) {
+  auto scheduler = getScheduler();
+  auto animationBackend = scheduler != nullptr
+      ? scheduler->getUIManager()->unstable_getAnimationBackend().lock()
+      : nullptr;
+  if (animationBackend == nullptr ||
+      !animationBackend->hasDirectWrites(surfaceId)) {
+    return nullptr;
+  }
+  auto views = animatedViews->getRegion(0, animatedViews->size());
+  auto stamps = animationStamps->getRegion(0, animationStamps->size());
+  std::vector<std::pair<Tag, uint64_t>> stampedViews;
+  for (jsize i = 0; i + 1 < animatedViews->size(); i += 2) {
+    stampedViews.emplace_back(views[i], stamps[views[i + 1]]);
+  }
+  auto values = animationBackend->newerDirectWrites(surfaceId, stampedViews);
+  if (values.empty()) {
+    return nullptr;
+  }
+  auto result = jni::JArrayClass<jobject>::newArray(values.size());
+  for (size_t i = 0; i < values.size(); i++) {
+    if (!values[i].empty()) {
+      result->setElement(
+          i, ReadableNativeMap::newObjectCxxArgs(std::move(values[i])).get());
+    }
+  }
+  return result;
+}
+
 jintArray FabricUIManagerBinding::getRelativeAncestorList(
     jint rootTag,
     jint childTag) {
@@ -630,6 +663,7 @@ void FabricUIManagerBinding::installFabricUIManager(
       runtimeExecutor, contextContainer, this);
   scheduler_ =
       std::make_shared<Scheduler>(toolbox, animationDriver_.get(), this);
+  mountingManager_->setUIManager(scheduler_->getUIManager());
 }
 
 void FabricUIManagerBinding::uninstallFabricUIManager() {
@@ -952,6 +986,8 @@ void FabricUIManagerBinding::registerNatives() {
           FabricUIManagerBinding::getRelativeAncestorList),
       makeNativeMethod(
           "mergeReactRevision", FabricUIManagerBinding::mergeReactRevision),
+      makeNativeMethod(
+          "newerDirectWrites", FabricUIManagerBinding::newerDirectWrites),
   });
 }
 

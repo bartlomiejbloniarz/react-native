@@ -5,6 +5,7 @@
  * LICENSE file in the root directory of this source tree.
  */
 
+#include <folly/Conv.h>
 #include <react/renderer/graphics/Transform.h>
 #include <react/renderer/graphics/TransformUtils.h>
 #include <stdexcept>
@@ -14,46 +15,95 @@ namespace facebook::react {
 
 namespace {
 
-void packBorderRadiusCorner(
+// A length as props accept it: points as a number, percents as a string.
+folly::dynamic packValueUnit(const ValueUnit& valueUnit) {
+  if (valueUnit.unit == UnitType::Percent) {
+    return folly::to<std::string>(valueUnit.value) + "%";
+  }
+  return valueUnit.value;
+}
+
+folly::dynamic packColor(const SharedColor& color) {
+  return color ? folly::dynamic(static_cast<int32_t>(*color))
+               : folly::dynamic(nullptr);
+}
+
+// Packs each set edge as border<Edge><suffix>, as the props parser reads it.
+template <typename T, typename PackValue>
+void packEdges(
     folly::dynamic& dyn,
-    const std::string& propName,
-    const std::optional<ValueUnit>& cornerValue) {
-  if (cornerValue.has_value()) {
-    dyn.insert(propName, cornerValue.value().value);
+    const std::string& suffix,
+    const CascadedRectangleEdges<T>& edges,
+    PackValue packValue) {
+  auto pack = [&](const char* edge, const std::optional<T>& value) {
+    if (value.has_value()) {
+      dyn[std::string("border") + edge + suffix] = packValue(*value);
+    }
+  };
+  pack("Left", edges.left);
+  pack("Top", edges.top);
+  pack("Right", edges.right);
+  pack("Bottom", edges.bottom);
+  pack("Start", edges.start);
+  pack("End", edges.end);
+  pack("Horizontal", edges.horizontal);
+  pack("Vertical", edges.vertical);
+  pack("Block", edges.block);
+  pack("BlockStart", edges.blockStart);
+  pack("BlockEnd", edges.blockEnd);
+  pack("", edges.all);
+}
+
+// Packs each set corner as border<Corner><suffix>, as the props parser reads
+// it.
+template <typename T, typename PackValue>
+void packCorners(
+    folly::dynamic& dyn,
+    const std::string& suffix,
+    const CascadedRectangleCorners<T>& corners,
+    PackValue packValue) {
+  auto pack = [&](const char* corner, const std::optional<T>& value) {
+    if (value.has_value()) {
+      dyn[std::string("border") + corner + suffix] = packValue(*value);
+    }
+  };
+  pack("TopLeft", corners.topLeft);
+  pack("TopRight", corners.topRight);
+  pack("BottomLeft", corners.bottomLeft);
+  pack("BottomRight", corners.bottomRight);
+  pack("TopStart", corners.topStart);
+  pack("TopEnd", corners.topEnd);
+  pack("BottomStart", corners.bottomStart);
+  pack("BottomEnd", corners.bottomEnd);
+  pack("StartStart", corners.startStart);
+  pack("StartEnd", corners.startEnd);
+  pack("EndStart", corners.endStart);
+  pack("EndEnd", corners.endEnd);
+  pack("", corners.all);
+}
+
+std::string borderCurveToString(BorderCurve curve) {
+  switch (curve) {
+    case BorderCurve::Circular:
+      return "circular";
+    case BorderCurve::Continuous:
+      return "continuous";
+    default:
+      throw std::runtime_error("Unknown border curve");
   }
 }
 
 void packBorderRadii(
     folly::dynamic& dyn,
-    const AnimatedPropBase& animatedProp) {
-  const auto& borderRadii = get<CascadedBorderRadii>(animatedProp);
-
-  packBorderRadiusCorner(dyn, "borderTopRightRadius", borderRadii.topRight);
-  packBorderRadiusCorner(dyn, "borderTopLeftRadius", borderRadii.topLeft);
-  packBorderRadiusCorner(
-      dyn, "borderBottomRightRadius", borderRadii.bottomRight);
-  packBorderRadiusCorner(dyn, "borderBottomLeftRadius", borderRadii.bottomLeft);
-  packBorderRadiusCorner(dyn, "borderTopStartRadius", borderRadii.topStart);
-  packBorderRadiusCorner(dyn, "borderTopEndRadius", borderRadii.topEnd);
-  packBorderRadiusCorner(
-      dyn, "borderBottomStartRadius", borderRadii.bottomStart);
-  packBorderRadiusCorner(dyn, "borderBottomEndRadius", borderRadii.bottomEnd);
-  packBorderRadiusCorner(dyn, "borderStartStartRadius", borderRadii.startStart);
-  packBorderRadiusCorner(dyn, "borderStartEndRadius", borderRadii.startEnd);
-  packBorderRadiusCorner(dyn, "borderEndStartRadius", borderRadii.endStart);
-  packBorderRadiusCorner(dyn, "borderEndEndRadius", borderRadii.endEnd);
-
-  if (borderRadii.all.has_value()) {
-    dyn.insert("borderRadius", borderRadii.all.value().value);
-  }
+    const CascadedBorderRadii& borderRadii) {
+  packCorners(dyn, "Radius", borderRadii, packValueUnit);
 }
 
-void packOpacity(folly::dynamic& dyn, const AnimatedPropBase& animatedProp) {
-  dyn.insert("opacity", get<Float>(animatedProp));
+void packOpacity(folly::dynamic& dyn, const Float& value) {
+  dyn.insert("opacity", value);
 }
 
-void packTransform(folly::dynamic& dyn, const AnimatedPropBase& animatedProp) {
-  const auto& transform = get<Transform>(animatedProp);
+void packTransform(folly::dynamic& dyn, const Transform& transform) {
   auto transformArray = folly::dynamic::array();
 
   for (const auto& operation : transform.operations) {
@@ -63,29 +113,18 @@ void packTransform(folly::dynamic& dyn, const AnimatedPropBase& animatedProp) {
   dyn.insert("transform", transformArray);
 }
 
-std::string unitTypeToString(UnitType unit) {
-  switch (unit) {
-    case UnitType::Undefined:
-      return "undefined";
-    case UnitType::Point:
-      return "point";
-    case UnitType::Percent:
-      return "percent";
-    default:
-      throw std::runtime_error("Unknown unit type");
-  }
-}
-
 void packTransformOrigin(
     folly::dynamic& dyn,
-    const AnimatedPropBase& animatedProp) {
-  const auto& transformOrigin = get<TransformOrigin>(animatedProp);
+    const TransformOrigin& transformOrigin) {
+  if (!transformOrigin.isSet()) {
+    dyn.insert("transformOrigin", nullptr);
+    return;
+  }
   auto originArray = folly::dynamic::array();
   for (const auto& xyValue : transformOrigin.xy) {
-    folly::dynamic valueObj = folly::dynamic::object();
-    valueObj["value"] = xyValue.value;
-    valueObj["unit"] = unitTypeToString(xyValue.unit);
-    originArray.push_back(valueObj);
+    originArray.push_back(
+        xyValue.unit == UnitType::Undefined ? folly::dynamic("50%")
+                                            : packValueUnit(xyValue));
   }
   originArray.push_back(transformOrigin.z);
   dyn.insert("transformOrigin", originArray);
@@ -93,68 +132,38 @@ void packTransformOrigin(
 
 void packBackgroundColor(
     folly::dynamic& dyn,
-    const AnimatedPropBase& animatedProp) {
-  const auto& backgroundColor = get<SharedColor>(animatedProp);
-  dyn.insert("backgroundColor", static_cast<int32_t>(*backgroundColor));
+    const SharedColor& backgroundColor) {
+  dyn.insert("backgroundColor", packColor(backgroundColor));
 }
 
-void packShadowColor(
-    folly::dynamic& dyn,
-    const AnimatedPropBase& animatedProp) {
-  const auto& shadowColor = get<SharedColor>(animatedProp);
-  dyn.insert("shadowColor", static_cast<int32_t>(*shadowColor));
+void packShadowColor(folly::dynamic& dyn, const SharedColor& shadowColor) {
+  dyn.insert("shadowColor", packColor(shadowColor));
 }
 
-void packShadowOffset(
-    folly::dynamic& dyn,
-    const AnimatedPropBase& animatedProp) {
-  const auto& shadowOffset = get<Size>(animatedProp);
+void packShadowOffset(folly::dynamic& dyn, const Size& shadowOffset) {
   dyn.insert(
       "shadowOffset",
       folly::dynamic::object("width", shadowOffset.width)(
           "height", shadowOffset.height));
 }
 
-void packShadowOpacity(
-    folly::dynamic& dyn,
-    const AnimatedPropBase& animatedProp) {
-  dyn.insert("shadowOpacity", get<Float>(animatedProp));
+void packShadowOpacity(folly::dynamic& dyn, const Float& value) {
+  dyn.insert("shadowOpacity", value);
 }
 
-void packShadowRadius(
-    folly::dynamic& dyn,
-    const AnimatedPropBase& animatedProp) {
-  dyn.insert("shadowRadius", get<Float>(animatedProp));
-}
-
-void packBorderColorEdge(
-    folly::dynamic& dyn,
-    const std::string& propName,
-    const std::optional<SharedColor>& colorValue) {
-  if (colorValue.has_value() && colorValue.value()) {
-    dyn.insert(propName, static_cast<int32_t>(*colorValue.value()));
-  }
+void packShadowRadius(folly::dynamic& dyn, const Float& value) {
+  dyn.insert("shadowRadius", value);
 }
 
 void packBorderColor(
     folly::dynamic& dyn,
-    const AnimatedPropBase& animatedProp) {
-  const auto& borderColors = get<CascadedBorderColors>(animatedProp);
-
-  packBorderColorEdge(dyn, "borderLeftColor", borderColors.left);
-  packBorderColorEdge(dyn, "borderTopColor", borderColors.top);
-  packBorderColorEdge(dyn, "borderRightColor", borderColors.right);
-  packBorderColorEdge(dyn, "borderBottomColor", borderColors.bottom);
-  packBorderColorEdge(dyn, "borderStartColor", borderColors.start);
-  packBorderColorEdge(dyn, "borderEndColor", borderColors.end);
-
-  if (borderColors.all.has_value() && borderColors.all.value()) {
-    dyn.insert("borderColor", static_cast<int32_t>(*borderColors.all.value()));
-  }
+    const CascadedBorderColors& borderColors) {
+  packEdges(dyn, "Color", borderColors, packColor);
 }
 
-void packFilter(folly::dynamic& dyn, const AnimatedPropBase& animatedProp) {
-  const auto& filters = get<std::vector<FilterFunction>>(animatedProp);
+void packFilter(
+    folly::dynamic& dyn,
+    const std::vector<FilterFunction>& filters) {
   auto filterArray = folly::dynamic::array();
   for (const auto& f : filters) {
     folly::dynamic filterObj = folly::dynamic::object();
@@ -175,23 +184,15 @@ void packFilter(folly::dynamic& dyn, const AnimatedPropBase& animatedProp) {
   dyn.insert("filter", filterArray);
 }
 
-void packOutlineColor(
-    folly::dynamic& dyn,
-    const AnimatedPropBase& animatedProp) {
-  const auto& outlineColor = get<SharedColor>(animatedProp);
-  dyn.insert("outlineColor", static_cast<int32_t>(*outlineColor));
+void packOutlineColor(folly::dynamic& dyn, const SharedColor& outlineColor) {
+  dyn.insert("outlineColor", packColor(outlineColor));
 }
 
-void packOutlineOffset(
-    folly::dynamic& dyn,
-    const AnimatedPropBase& animatedProp) {
-  dyn.insert("outlineOffset", get<Float>(animatedProp));
+void packOutlineOffset(folly::dynamic& dyn, const Float& value) {
+  dyn.insert("outlineOffset", value);
 }
 
-void packOutlineStyle(
-    folly::dynamic& dyn,
-    const AnimatedPropBase& animatedProp) {
-  const auto& outlineStyle = get<OutlineStyle>(animatedProp);
+void packOutlineStyle(folly::dynamic& dyn, const OutlineStyle& outlineStyle) {
   std::string styleStr;
   switch (outlineStyle) {
     case OutlineStyle::Solid:
@@ -209,56 +210,14 @@ void packOutlineStyle(
   dyn.insert("outlineStyle", styleStr);
 }
 
-void packOutlineWidth(
-    folly::dynamic& dyn,
-    const AnimatedPropBase& animatedProp) {
-  dyn.insert("outlineWidth", get<Float>(animatedProp));
-}
-
-void packBorderCurveEdge(
-    folly::dynamic& dyn,
-    const std::string& propName,
-    const std::optional<BorderCurve>& curveValue) {
-  if (curveValue.has_value()) {
-    std::string curveStr;
-    switch (curveValue.value()) {
-      case BorderCurve::Circular:
-        curveStr = "circular";
-        break;
-      case BorderCurve::Continuous:
-        curveStr = "continuous";
-        break;
-      default:
-        throw std::runtime_error("Unknown border curve");
-    }
-    dyn.insert(propName, curveStr);
-  }
+void packOutlineWidth(folly::dynamic& dyn, const Float& value) {
+  dyn.insert("outlineWidth", value);
 }
 
 void packBorderCurves(
     folly::dynamic& dyn,
-    const AnimatedPropBase& animatedProp) {
-  const auto& borderCurves = get<CascadedBorderCurves>(animatedProp);
-
-  packBorderCurveEdge(dyn, "borderTopLeftCurve", borderCurves.topLeft);
-  packBorderCurveEdge(dyn, "borderTopRightCurve", borderCurves.topRight);
-  packBorderCurveEdge(dyn, "borderBottomLeftCurve", borderCurves.bottomLeft);
-  packBorderCurveEdge(dyn, "borderBottomRightCurve", borderCurves.bottomRight);
-
-  if (borderCurves.all.has_value()) {
-    std::string curveStr;
-    switch (borderCurves.all.value()) {
-      case BorderCurve::Circular:
-        curveStr = "circular";
-        break;
-      case BorderCurve::Continuous:
-        curveStr = "continuous";
-        break;
-      default:
-        throw std::runtime_error("Unknown border curve");
-    }
-    dyn.insert("borderCurve", curveStr);
-  }
+    const CascadedBorderCurves& borderCurves) {
+  packCorners(dyn, "Curve", borderCurves, borderCurveToString);
 }
 
 std::string borderStyleToString(BorderStyle style) {
@@ -274,36 +233,15 @@ std::string borderStyleToString(BorderStyle style) {
   }
 }
 
-void packBorderStyleEdge(
-    folly::dynamic& dyn,
-    const std::string& propName,
-    const std::optional<BorderStyle>& styleValue) {
-  if (styleValue.has_value()) {
-    dyn.insert(propName, borderStyleToString(styleValue.value()));
-  }
-}
-
 void packBorderStyles(
     folly::dynamic& dyn,
-    const AnimatedPropBase& animatedProp) {
-  const auto& borderStyles = get<CascadedBorderStyles>(animatedProp);
-
-  packBorderStyleEdge(dyn, "borderLeftStyle", borderStyles.left);
-  packBorderStyleEdge(dyn, "borderTopStyle", borderStyles.top);
-  packBorderStyleEdge(dyn, "borderRightStyle", borderStyles.right);
-  packBorderStyleEdge(dyn, "borderBottomStyle", borderStyles.bottom);
-  packBorderStyleEdge(dyn, "borderStartStyle", borderStyles.start);
-  packBorderStyleEdge(dyn, "borderEndStyle", borderStyles.end);
-
-  if (borderStyles.all.has_value()) {
-    dyn.insert("borderStyle", borderStyleToString(borderStyles.all.value()));
-  }
+    const CascadedBorderStyles& borderStyles) {
+  packEdges(dyn, "Style", borderStyles, borderStyleToString);
 }
 
 void packPointerEvents(
     folly::dynamic& dyn,
-    const AnimatedPropBase& animatedProp) {
-  const auto& pointerEvents = get<PointerEventsMode>(animatedProp);
+    const PointerEventsMode& pointerEvents) {
   std::string pointerEventsStr;
   switch (pointerEvents) {
     case PointerEventsMode::Auto:
@@ -324,8 +262,7 @@ void packPointerEvents(
   dyn.insert("pointerEvents", pointerEventsStr);
 }
 
-void packIsolation(folly::dynamic& dyn, const AnimatedPropBase& animatedProp) {
-  const auto& isolation = get<Isolation>(animatedProp);
+void packIsolation(folly::dynamic& dyn, const Isolation& isolation) {
   std::string isolationStr;
   switch (isolation) {
     case Isolation::Auto:
@@ -340,8 +277,7 @@ void packIsolation(folly::dynamic& dyn, const AnimatedPropBase& animatedProp) {
   dyn.insert("isolation", isolationStr);
 }
 
-void packCursor(folly::dynamic& dyn, const AnimatedPropBase& animatedProp) {
-  const auto& cursor = get<Cursor>(animatedProp);
+void packCursor(folly::dynamic& dyn, const Cursor& cursor) {
   std::string cursorStr;
   switch (cursor) {
     case Cursor::Auto:
@@ -458,8 +394,9 @@ void packCursor(folly::dynamic& dyn, const AnimatedPropBase& animatedProp) {
   dyn.insert("cursor", cursorStr);
 }
 
-void packBoxShadow(folly::dynamic& dyn, const AnimatedPropBase& animatedProp) {
-  const auto& boxShadows = get<std::vector<BoxShadow>>(animatedProp);
+void packBoxShadow(
+    folly::dynamic& dyn,
+    const std::vector<BoxShadow>& boxShadows) {
   auto shadowArray = folly::dynamic::array();
   for (const auto& shadow : boxShadows) {
     folly::dynamic shadowObj = folly::dynamic::object();
@@ -476,10 +413,7 @@ void packBoxShadow(folly::dynamic& dyn, const AnimatedPropBase& animatedProp) {
   dyn.insert("boxShadow", shadowArray);
 }
 
-void packMixBlendMode(
-    folly::dynamic& dyn,
-    const AnimatedPropBase& animatedProp) {
-  const auto& mixBlendMode = get<BlendMode>(animatedProp);
+void packMixBlendMode(folly::dynamic& dyn, const BlendMode& mixBlendMode) {
   std::string blendModeStr;
   switch (mixBlendMode) {
     case BlendMode::Normal:
@@ -541,8 +475,7 @@ void packMixBlendMode(
 
 void packBackfaceVisibility(
     folly::dynamic& dyn,
-    const AnimatedPropBase& animatedProp) {
-  const auto& backfaceVisibility = get<BackfaceVisibility>(animatedProp);
+    const BackfaceVisibility& backfaceVisibility) {
   std::string visibilityStr;
   switch (backfaceVisibility) {
     case BackfaceVisibility::Auto:
@@ -565,95 +498,95 @@ void packAnimatedProp(
     const std::unique_ptr<AnimatedPropBase>& animatedProp) {
   switch (animatedProp->propName) {
     case OPACITY:
-      packOpacity(dyn, *animatedProp);
+      packOpacity(dyn, get<Float>(*animatedProp));
       break;
 
     case TRANSFORM:
-      packTransform(dyn, *animatedProp);
+      packTransform(dyn, get<Transform>(*animatedProp));
       break;
 
     case TRANSFORM_ORIGIN:
-      packTransformOrigin(dyn, *animatedProp);
+      packTransformOrigin(dyn, get<TransformOrigin>(*animatedProp));
       break;
 
     case BACKGROUND_COLOR:
-      packBackgroundColor(dyn, *animatedProp);
+      packBackgroundColor(dyn, get<SharedColor>(*animatedProp));
       break;
 
     case BORDER_RADII:
-      packBorderRadii(dyn, *animatedProp);
+      packBorderRadii(dyn, get<CascadedBorderRadii>(*animatedProp));
       break;
 
     case SHADOW_COLOR:
-      packShadowColor(dyn, *animatedProp);
+      packShadowColor(dyn, get<SharedColor>(*animatedProp));
       break;
 
     case SHADOW_OFFSET:
-      packShadowOffset(dyn, *animatedProp);
+      packShadowOffset(dyn, get<Size>(*animatedProp));
       break;
 
     case SHADOW_OPACITY:
-      packShadowOpacity(dyn, *animatedProp);
+      packShadowOpacity(dyn, get<Float>(*animatedProp));
       break;
 
     case SHADOW_RADIUS:
-      packShadowRadius(dyn, *animatedProp);
+      packShadowRadius(dyn, get<Float>(*animatedProp));
       break;
 
     case BORDER_COLOR:
-      packBorderColor(dyn, *animatedProp);
+      packBorderColor(dyn, get<CascadedBorderColors>(*animatedProp));
       break;
 
     case FILTER:
-      packFilter(dyn, *animatedProp);
+      packFilter(dyn, get<std::vector<FilterFunction>>(*animatedProp));
       break;
 
     case OUTLINE_COLOR:
-      packOutlineColor(dyn, *animatedProp);
+      packOutlineColor(dyn, get<SharedColor>(*animatedProp));
       break;
 
     case OUTLINE_OFFSET:
-      packOutlineOffset(dyn, *animatedProp);
+      packOutlineOffset(dyn, get<Float>(*animatedProp));
       break;
 
     case OUTLINE_STYLE:
-      packOutlineStyle(dyn, *animatedProp);
+      packOutlineStyle(dyn, get<OutlineStyle>(*animatedProp));
       break;
 
     case OUTLINE_WIDTH:
-      packOutlineWidth(dyn, *animatedProp);
+      packOutlineWidth(dyn, get<Float>(*animatedProp));
       break;
 
     case BORDER_CURVES:
-      packBorderCurves(dyn, *animatedProp);
+      packBorderCurves(dyn, get<CascadedBorderCurves>(*animatedProp));
       break;
 
     case BORDER_STYLES:
-      packBorderStyles(dyn, *animatedProp);
+      packBorderStyles(dyn, get<CascadedBorderStyles>(*animatedProp));
       break;
 
     case POINTER_EVENTS:
-      packPointerEvents(dyn, *animatedProp);
+      packPointerEvents(dyn, get<PointerEventsMode>(*animatedProp));
       break;
 
     case ISOLATION:
-      packIsolation(dyn, *animatedProp);
+      packIsolation(dyn, get<Isolation>(*animatedProp));
       break;
 
     case CURSOR:
-      packCursor(dyn, *animatedProp);
+      packCursor(dyn, get<Cursor>(*animatedProp));
       break;
 
     case BOX_SHADOW:
-      packBoxShadow(dyn, *animatedProp);
+      packBoxShadow(dyn, get<std::vector<BoxShadow>>(*animatedProp));
       break;
 
     case MIX_BLEND_MODE:
-      packMixBlendMode(dyn, *animatedProp);
+      packMixBlendMode(dyn, get<BlendMode>(*animatedProp));
       break;
 
     case BACKFACE_VISIBILITY:
-      packBackfaceVisibility(dyn, *animatedProp);
+      packBackfaceVisibility(dyn, get<BackfaceVisibility>(*animatedProp));
       break;
 
     case WIDTH:
@@ -694,6 +627,110 @@ void packAnimatedProp(
 } // namespace
 
 namespace animationbackend {
+
+void packAnimatedProp(
+    folly::dynamic& dyn,
+    const std::unique_ptr<AnimatedPropBase>& animatedProp) {
+  react::packAnimatedProp(dyn, animatedProp);
+}
+
+bool isWrittenDirectly(PropName propName) {
+  switch (propName) {
+    case OPACITY:
+    case TRANSFORM:
+    case TRANSFORM_ORIGIN:
+    case BACKGROUND_COLOR:
+    case SHADOW_COLOR:
+    case SHADOW_OFFSET:
+    case SHADOW_OPACITY:
+    case SHADOW_RADIUS:
+    case FILTER:
+    case OUTLINE_COLOR:
+    case OUTLINE_OFFSET:
+    case OUTLINE_STYLE:
+    case OUTLINE_WIDTH:
+    case POINTER_EVENTS:
+    case ISOLATION:
+    case CURSOR:
+    case BOX_SHADOW:
+    case MIX_BLEND_MODE:
+    case BACKFACE_VISIBILITY:
+      return true;
+    default:
+      return false;
+  }
+}
+
+bool packsPerEdge(PropName propName) {
+  return propName == BORDER_RADII || propName == BORDER_COLOR ||
+      propName == BORDER_CURVES || propName == BORDER_STYLES;
+}
+
+folly::dynamic packViewProp(PropName propName, const BaseViewProps& viewProps) {
+  folly::dynamic dyn = folly::dynamic::object();
+  switch (propName) {
+    case OPACITY:
+      packOpacity(dyn, viewProps.opacity);
+      break;
+    case TRANSFORM:
+      packTransform(dyn, viewProps.transform);
+      break;
+    case TRANSFORM_ORIGIN:
+      packTransformOrigin(dyn, viewProps.transformOrigin);
+      break;
+    case BACKGROUND_COLOR:
+      packBackgroundColor(dyn, viewProps.backgroundColor);
+      break;
+    case SHADOW_COLOR:
+      packShadowColor(dyn, viewProps.shadowColor);
+      break;
+    case SHADOW_OFFSET:
+      packShadowOffset(dyn, viewProps.shadowOffset);
+      break;
+    case SHADOW_OPACITY:
+      packShadowOpacity(dyn, viewProps.shadowOpacity);
+      break;
+    case SHADOW_RADIUS:
+      packShadowRadius(dyn, viewProps.shadowRadius);
+      break;
+    case FILTER:
+      packFilter(dyn, viewProps.filter);
+      break;
+    case OUTLINE_COLOR:
+      packOutlineColor(dyn, viewProps.outlineColor);
+      break;
+    case OUTLINE_OFFSET:
+      packOutlineOffset(dyn, viewProps.outlineOffset);
+      break;
+    case OUTLINE_STYLE:
+      packOutlineStyle(dyn, viewProps.outlineStyle);
+      break;
+    case OUTLINE_WIDTH:
+      packOutlineWidth(dyn, viewProps.outlineWidth);
+      break;
+    case POINTER_EVENTS:
+      packPointerEvents(dyn, viewProps.pointerEvents);
+      break;
+    case ISOLATION:
+      packIsolation(dyn, viewProps.isolation);
+      break;
+    case CURSOR:
+      packCursor(dyn, viewProps.cursor);
+      break;
+    case BOX_SHADOW:
+      packBoxShadow(dyn, viewProps.boxShadow);
+      break;
+    case MIX_BLEND_MODE:
+      packMixBlendMode(dyn, viewProps.mixBlendMode);
+      break;
+    case BACKFACE_VISIBILITY:
+      packBackfaceVisibility(dyn, viewProps.backfaceVisibility);
+      break;
+    default:
+      break;
+  }
+  return dyn;
+}
 
 folly::dynamic packAnimatedProps(const AnimatedProps& animatedProps) {
   auto dyn = animatedProps.rawProps ? animatedProps.rawProps->toDynamic()
