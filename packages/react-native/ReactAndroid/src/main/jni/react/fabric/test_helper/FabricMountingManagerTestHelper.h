@@ -17,6 +17,8 @@
 
 #include <react/fabric/ComponentFactory.h>
 #include <react/fabric/FabricMountingManager.h>
+#include <react/renderer/animationbackend/AnimatedProps.h>
+#include <react/renderer/uimanager/UIManager.h>
 
 #include <unordered_map>
 
@@ -56,6 +58,18 @@ class FabricMountingManagerTestHelper : public jni::HybridClass<FabricMountingMa
   void registerViewComponent(ComponentFactory *componentFactory);
 
   void commitViews(jint surfaceId, jni::alias_ref<jni::JArrayInt> tags);
+  // Writes through the animation backend of useSharedAnimatedBackend to
+  // views created by createView, which commitReactViews commits as React
+  // would.
+  void createView(jint surfaceId, jint tag, jni::alias_ref<NativeMap::javaobject> props);
+  void writeProps(jint tag, jni::alias_ref<NativeMap::javaobject> props);
+  // Writes opacity and marginTop of `props` as typed props.
+  void writeTypedProps(jint tag, jni::alias_ref<NativeMap::javaobject> props);
+  void requestPreallocation(jint tag);
+  void commitReactViews(jint surfaceId, jni::alias_ref<jni::JArrayInt> tags);
+  // Mounts a frame of an animation setting `props` of the view, without a new
+  // revision, as LayoutAnimation does.
+  void animateFrame(jint surfaceId, jint tag, jni::alias_ref<NativeMap::javaobject> props);
   void recordPulledDeletes(jint surfaceId);
   jni::local_ref<jni::JArrayInt> pulledDeleteTags();
 
@@ -82,6 +96,12 @@ class FabricMountingManagerTestHelper : public jni::HybridClass<FabricMountingMa
   std::shared_ptr<RuntimeScheduler> runtimeScheduler_;
   class DeleteRecorder;
   std::shared_ptr<DeleteRecorder> deleteRecorder_;
+  class FrameAnimator;
+  std::shared_ptr<FrameAnimator> frameAnimator_;
+  std::unordered_map<Tag, std::shared_ptr<const ShadowNode>> views_;
+
+  std::shared_ptr<UIManager> getUIManager();
+  void write(Tag tag, AnimatedProps props);
 };
 
 } // namespace facebook::react

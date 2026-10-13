@@ -11,6 +11,8 @@
 #include <react/featureflags/ReactNativeFeatureFlags.h>
 #include <react/featureflags/ReactNativeFeatureFlagsDefaults.h>
 #include <react/renderer/animationbackend/AnimatedProps.h>
+#include <react/renderer/animationbackend/AnimatedPropsBuilder.h>
+#include <react/renderer/animationbackend/AnimationMutation.h>
 #include <react/renderer/componentregistry/ComponentDescriptorProviderRegistry.h>
 #include <react/renderer/components/root/RootShadowNode.h>
 #include <react/renderer/components/view/ViewComponentDescriptor.h>
@@ -23,6 +25,8 @@
 #include <react/renderer/mounting/ShadowView.h>
 #include <react/renderer/scheduler/Scheduler.h>
 #include <react/renderer/telemetry/TransactionTelemetry.h>
+
+#include <mutex>
 
 namespace facebook::react {
 
@@ -58,6 +62,34 @@ class FabricMountingManagerTestHelper::DeleteRecorder
   }
 
   mutable std::vector<Tag> deletedTags;
+};
+
+// Adds the frame it holds to the next pull, as LayoutAnimation does.
+class FabricMountingManagerTestHelper::FrameAnimator
+    : public MountingOverrideDelegate {
+ public:
+  bool shouldOverridePullTransaction() const override {
+    std::lock_guard lock(mutex);
+    return frame.has_value();
+  }
+
+  std::optional<MountingTransaction> pullTransaction(
+      SurfaceId surfaceId,
+      MountingTransaction::Number number,
+      const TransactionTelemetry& telemetry,
+      ShadowViewMutationList mutations) const override {
+    {
+      std::lock_guard lock(mutex);
+      if (frame) {
+        mutations.push_back(*std::exchange(frame, std::nullopt));
+      }
+    }
+    return MountingTransaction{
+        surfaceId, number, std::move(mutations), telemetry};
+  }
+
+  mutable std::mutex mutex;
+  mutable std::optional<ShadowViewMutation> frame;
 };
 
 namespace {
@@ -400,6 +432,122 @@ FabricMountingManagerTestHelper::pulledDeleteTags() {
   return array;
 }
 
+std::shared_ptr<UIManager> FabricMountingManagerTestHelper::getUIManager() {
+  return javaUIManager_->getBinding()->getScheduler()->getUIManager();
+}
+
+void FabricMountingManagerTestHelper::createView(
+    jint surfaceId,
+    jint tag,
+    jni::alias_ref<NativeMap::javaobject> props) {
+  auto family = viewComponentDescriptor_->createFamily(
+      {.tag = tag, .surfaceId = surfaceId, .instanceHandle = nullptr});
+  PropsParserContext context{
+      surfaceId, *viewComponentDescriptor_->getContextContainer()};
+  auto viewProps = viewComponentDescriptor_->cloneProps(
+      context, nullptr, RawProps(props->cthis()->consume()));
+  views_[tag] =
+      viewComponentDescriptor_->createShadowNode({.props = viewProps}, family);
+}
+
+void FabricMountingManagerTestHelper::writeProps(
+    jint tag,
+    jni::alias_ref<NativeMap::javaobject> props) {
+  write(
+      tag,
+      {.props = {},
+       .rawProps = std::make_unique<RawProps>(props->cthis()->consume())});
+}
+
+void FabricMountingManagerTestHelper::writeTypedProps(
+    jint tag,
+    jni::alias_ref<NativeMap::javaobject> props) {
+  auto values = props->cthis()->consume();
+  AnimatedPropsBuilder builder;
+  if (auto opacity = values.get_ptr("opacity")) {
+    builder.setOpacity(static_cast<Float>(opacity->asDouble()));
+  }
+  if (auto marginTop = values.get_ptr("marginTop")) {
+    CascadedRectangleEdges<yoga::StyleLength> margins;
+    margins.top =
+        yoga::StyleLength::points(static_cast<float>(marginTop->asDouble()));
+    builder.setMargin(margins);
+  }
+  write(tag, builder.get());
+}
+
+void FabricMountingManagerTestHelper::write(Tag tag, AnimatedProps props) {
+  const auto& view = views_.at(tag);
+  getUIManager()->unstable_getAnimationBackend().lock()->pushAnimationMutations(
+      [&](AnimationTimestamp /*timestamp*/) {
+        AnimationMutations mutations;
+        mutations.batch.push_back(
+            AnimationMutation{
+                .tag = tag,
+                .family = view->getFamilyShared(),
+                .props = std::move(props)});
+        return mutations;
+      });
+}
+
+void FabricMountingManagerTestHelper::requestPreallocation(jint tag) {
+  SchedulerDelegate* delegate = javaUIManager_->getBinding();
+  delegate->schedulerDidRequestPreliminaryViewAllocation(*views_.at(tag));
+}
+
+void FabricMountingManagerTestHelper::commitReactViews(
+    jint surfaceId,
+    jni::alias_ref<jni::JArrayInt> tags) {
+  auto children =
+      std::make_shared<std::vector<std::shared_ptr<const ShadowNode>>>();
+  for (auto tag : toTags(tags)) {
+    children->push_back(views_.at(tag));
+  }
+  getUIManager()->getShadowTreeRegistry().visit(
+      surfaceId, [&](const ShadowTree& shadowTree) {
+        shadowTree.commit(
+            [&](const RootShadowNode& oldRootShadowNode) {
+              return std::make_shared<RootShadowNode>(
+                  oldRootShadowNode,
+                  ShadowNodeFragment{
+                      .props = ShadowNodeFragment::propsPlaceholder(),
+                      .children = children});
+            },
+            {.mountSynchronously = true,
+             .source = ShadowTreeCommitSource::React});
+      });
+}
+
+void FabricMountingManagerTestHelper::animateFrame(
+    jint surfaceId,
+    jint tag,
+    jni::alias_ref<NativeMap::javaobject> props) {
+  auto rawProps = props->cthis()->consume();
+  getUIManager()->getShadowTreeRegistry().visit(
+      surfaceId, [&](const ShadowTree& shadowTree) {
+        if (!frameAnimator_) {
+          frameAnimator_ = std::make_shared<FrameAnimator>();
+          shadowTree.getMountingCoordinator()->setMountingOverrideDelegate(
+              frameAnimator_);
+        }
+        const auto& root = *shadowTree.getCurrentRevision().rootShadowNode;
+        auto ancestors = views_.at(tag)->getFamily().getAncestors(root);
+        const auto& [parent, index] = ancestors.back();
+        const auto& node = *parent.get().getChildren().at(index);
+        auto view = ShadowView(node);
+        auto frameView = view;
+        PropsParserContext context{surfaceId, *node.getContextContainer()};
+        frameView.props = node.getComponentDescriptor().cloneProps(
+            context, node.getProps(), RawProps(rawProps));
+        {
+          std::lock_guard lock(frameAnimator_->mutex);
+          frameAnimator_->frame =
+              ShadowViewMutation::UpdateMutation(view, frameView, surfaceId);
+        }
+        shadowTree.notifyDelegatesOfUpdates();
+      });
+}
+
 void FabricMountingManagerTestHelper::registerNatives() {
   registerHybrid({
       makeNativeMethod(
@@ -458,6 +606,20 @@ void FabricMountingManagerTestHelper::registerNatives() {
           FabricMountingManagerTestHelper::registerViewComponent),
       makeNativeMethod(
           "commitViews", FabricMountingManagerTestHelper::commitViews),
+      makeNativeMethod(
+          "createView", FabricMountingManagerTestHelper::createView),
+      makeNativeMethod(
+          "writeProps", FabricMountingManagerTestHelper::writeProps),
+      makeNativeMethod(
+          "writeTypedProps", FabricMountingManagerTestHelper::writeTypedProps),
+      makeNativeMethod(
+          "requestPreallocation",
+          FabricMountingManagerTestHelper::requestPreallocation),
+      makeNativeMethod(
+          "commitReactViews",
+          FabricMountingManagerTestHelper::commitReactViews),
+      makeNativeMethod(
+          "animateFrame", FabricMountingManagerTestHelper::animateFrame),
       makeNativeMethod(
           "recordPulledDeletes",
           FabricMountingManagerTestHelper::recordPulledDeletes),

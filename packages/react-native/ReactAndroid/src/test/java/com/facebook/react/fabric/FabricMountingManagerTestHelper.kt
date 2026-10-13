@@ -79,6 +79,24 @@ private constructor(fabricUIManager: FabricUIManager) : HybridClassBase() {
 
   external fun commitViews(surfaceId: Int, tags: IntArray)
 
+  /**
+   * Writes through the animation backend of useSharedAnimatedBackend to views of [createView],
+   * committed as React would by [commitReactViews].
+   */
+  external fun createView(surfaceId: Int, tag: Int, props: NativeMap)
+
+  external fun writeProps(tag: Int, props: NativeMap)
+
+  /** Writes opacity and marginTop of [props] as typed props. */
+  external fun writeTypedProps(tag: Int, props: NativeMap)
+
+  external fun requestPreallocation(tag: Int)
+
+  external fun commitReactViews(surfaceId: Int, tags: IntArray)
+
+  /** Mounts a frame of an animation setting [props] of the view, as LayoutAnimation does. */
+  external fun animateFrame(surfaceId: Int, tag: Int, props: NativeMap)
+
   /** Records the Delete mutations of every transaction pulled for the surface from now on. */
   external fun recordPulledDeletes(surfaceId: Int)
 

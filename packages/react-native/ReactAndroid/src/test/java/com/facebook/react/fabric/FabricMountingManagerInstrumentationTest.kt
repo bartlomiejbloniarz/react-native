@@ -11,6 +11,7 @@ import android.graphics.Rect
 import android.view.View
 import androidx.test.ext.junit.runners.AndroidJUnit4
 import androidx.test.platform.app.InstrumentationRegistry
+import com.facebook.react.R
 import com.facebook.react.ReactRootView
 import com.facebook.react.bridge.JSExceptionHandler
 import com.facebook.react.bridge.JavaOnlyMap
@@ -19,6 +20,7 @@ import com.facebook.react.bridge.ReadableType
 import com.facebook.react.bridge.WritableNativeArray
 import com.facebook.react.bridge.WritableNativeMap
 import com.facebook.react.fabric.events.EventBeatManager
+import com.facebook.react.fabric.mounting.MountItemDispatcher
 import com.facebook.react.fabric.mounting.MountingManager
 import com.facebook.react.fabric.mounting.MountingManager.MountItemExecutor
 import com.facebook.react.fabric.mounting.mountitems.IntBufferBatchMountItem
@@ -35,6 +37,7 @@ import com.facebook.react.uimanager.events.BatchEventDispatchedListener
 import com.facebook.react.views.view.ReactViewGroup
 import com.facebook.react.views.view.ReactViewManager
 import com.facebook.soloader.SoLoader
+import kotlin.concurrent.thread
 import org.assertj.core.api.Assertions.assertThat
 import org.assertj.core.api.Assertions.within
 import org.junit.After
@@ -518,8 +521,27 @@ class FabricMountingManagerInstrumentationTest {
    */
   private val bindingDependencies = mutableListOf<Any>()
 
-  private fun registerBinding(fabricUIManager: FabricUIManager): FabricMountingManagerTestHelper {
-    val binding = FabricUIManagerBinding()
+  private fun overrideBackendFlags(
+      accumulatedRawProps: Boolean,
+      sharedAnimatedBackend: Boolean = false,
+      viewPreallocation: Boolean = true,
+  ) {
+    val flags =
+        object : ReactNativeFeatureFlagsDefaults() {
+          override fun enableAccumulatedUpdatesInRawPropsAndroid(): Boolean = accumulatedRawProps
+
+          override fun useSharedAnimatedBackend(): Boolean = sharedAnimatedBackend
+
+          override fun disableViewPreallocationAndroid(): Boolean = !viewPreallocation
+        }
+    ReactNativeFeatureFlags.dangerouslyForceOverride(flags)
+    ReactNativeFeatureFlagsCxxInterop.dangerouslyForceOverride(flags)
+  }
+
+  private fun registerBinding(
+      fabricUIManager: FabricUIManager,
+      binding: FabricUIManagerBinding = FabricUIManagerBinding(),
+  ): FabricMountingManagerTestHelper {
     val helper = FabricMountingManagerTestHelper.create(fabricUIManager)
     cleanups.addLast { runOnUiThread { binding.unregister() } }
     val componentFactory = ComponentFactory()
@@ -582,6 +604,33 @@ class FabricMountingManagerInstrumentationTest {
     return surfaceId to { fabricUIManager.stopSurface(surfaceId) }
   }
 
+  /** Starts a surface showing views [tags] and returns its id. */
+  private fun startSurfaceWithViews(
+      fabricUIManager: FabricUIManager,
+      helper: FabricMountingManagerTestHelper,
+      tags: IntArray,
+  ): Int {
+    lateinit var surfaceHandler: SurfaceHandlerBinding
+    runOnUiThread {
+      surfaceHandler = startSurfaceWithHandler(fabricUIManager)
+      cleanups.addLast { runOnUiThread { fabricUIManager.stopSurface(surfaceHandler) } }
+      helper.commitViews(surfaceHandler.surfaceId, tags)
+    }
+    return surfaceHandler.surfaceId
+  }
+
+  private fun props(vararg entries: Pair<String, Any?>): WritableNativeMap =
+      WritableNativeMap().apply {
+        for ((key, value) in entries) {
+          when (value) {
+            null -> putNull(key)
+            is Double -> putDouble(key, value)
+            is String -> putString(key, value)
+            else -> error("Unsupported prop $key")
+          }
+        }
+      }
+
   @Test
   fun native_stopSurfaceWithSurfaceHandler_pullModel_pullsDeletes() {
     assertStoppingSurfacePullsDeletes(pullModel = true, ::startBridgelessSurface)
@@ -628,5 +677,171 @@ class FabricMountingManagerInstrumentationTest {
     }
 
     assertThat(helper.pulledDeleteTags()).containsExactlyInAnyOrder(42, 43)
+  }
+
+  private fun dispatchMountItems(fabricUIManager: FabricUIManager) {
+    val dispatcher =
+        FabricUIManager::class
+            .java
+            .getDeclaredField("mMountItemDispatcher")
+            .apply { isAccessible = true }
+            .get(fabricUIManager) as MountItemDispatcher
+    runOnUiThread {
+      dispatcher.dispatchPreMountItems(System.nanoTime())
+      dispatcher.tryDispatchMountItems()
+    }
+  }
+
+  /** Covered writes to views created after them, including a reset, stay when the views move. */
+  @Test
+  fun native_coveredWritesStayWhenTheirViewsMove() {
+    overrideBackendFlags(
+        accumulatedRawProps = false,
+        sharedAnimatedBackend = true,
+        viewPreallocation = false,
+    )
+    val fabricUIManager = createFabricUIManager()
+    val helper = registerBinding(fabricUIManager)
+    val surfaceId = startSurfaceWithViews(fabricUIManager, helper, intArrayOf())
+    helper.createView(surfaceId, 42, props("opacity" to 1.0, "nativeID" to "a"))
+    helper.createView(surfaceId, 43, props("opacity" to 0.2, "nativeID" to "b"))
+    runOnUiThread {
+      helper.writeTypedProps(42, props("opacity" to 0.5))
+      helper.writeProps(43, props("opacity" to null))
+    }
+    val alphas = mutableListOf<Float>()
+    fun commitAndReadAlphas(tags: IntArray) {
+      thread { helper.commitReactViews(surfaceId, tags) }.join()
+      dispatchMountItems(fabricUIManager)
+      runOnUiThread {
+        alphas.add(fabricUIManager.resolveView(42)!!.alpha)
+        alphas.add(fabricUIManager.resolveView(43)!!.alpha)
+      }
+    }
+
+    commitAndReadAlphas(intArrayOf(42, 43))
+    commitAndReadAlphas(intArrayOf(43, 42))
+
+    assertThat(alphas).containsExactly(0.5f, 1f, 0.5f, 1f)
+  }
+
+  /**
+   * An animation frame mounted without a new revision shows its value over the direct writes the
+   * last revision covers, and newer direct writes show over it.
+   */
+  @Test
+  fun native_anAnimationFrameWithoutARevisionKeepsNewerDirectWrites() {
+    overrideBackendFlags(accumulatedRawProps = false, sharedAnimatedBackend = true)
+    val fabricUIManager = createFabricUIManager()
+    val helper = registerBinding(fabricUIManager)
+    val surfaceId = startSurfaceWithViews(fabricUIManager, helper, intArrayOf())
+    helper.createView(surfaceId, 42, props("opacity" to 0.2))
+    thread { helper.commitReactViews(surfaceId, intArrayOf(42)) }.join()
+    dispatchMountItems(fabricUIManager)
+    val alphas = mutableListOf<Float>()
+    fun readAlpha() {
+      dispatchMountItems(fabricUIManager)
+      runOnUiThread { alphas.add(fabricUIManager.resolveView(42)!!.alpha) }
+    }
+
+    runOnUiThread { helper.writeProps(42, props("opacity" to 0.6)) }
+    thread { helper.commitReactViews(surfaceId, intArrayOf(42)) }.join()
+    readAlpha()
+    runOnUiThread { helper.animateFrame(surfaceId, 42, props("opacity" to 0.3)) }
+    readAlpha()
+    runOnUiThread { helper.writeProps(42, props("opacity" to 0.7)) }
+    runOnUiThread { helper.animateFrame(surfaceId, 42, props("opacity" to 0.4)) }
+    readAlpha()
+
+    assertThat(alphas).containsExactly(0.6f, 0.3f, 0.7f)
+  }
+
+  /**
+   * A backend write to a view that is not created yet, covered by the commit that inserts it, is
+   * mounted with the view when it was preallocated before that commit with older props.
+   */
+  @Test
+  fun native_aCoveredWriteReachesAViewPreallocatedAfterIt() {
+    overrideBackendFlags(accumulatedRawProps = false, sharedAnimatedBackend = true)
+    val fabricUIManager = createFabricUIManager()
+    val binding = FabricUIManagerBinding()
+    val helper = registerBinding(fabricUIManager, binding)
+    val surfaceId = startSurfaceWithViews(fabricUIManager, helper, intArrayOf())
+    helper.createView(surfaceId, 42, props("opacity" to 0.2))
+    runOnUiThread { helper.writeProps(42, props("opacity" to 0.7)) }
+    thread {
+          helper.requestPreallocation(42)
+          binding.drainPreallocateViewsQueue()
+        }
+        .join()
+    dispatchMountItems(fabricUIManager)
+    var preallocatedAlpha = 0f
+    runOnUiThread { preallocatedAlpha = fabricUIManager.resolveView(42)!!.alpha }
+
+    thread { helper.commitReactViews(surfaceId, intArrayOf(42)) }.join()
+    dispatchMountItems(fabricUIManager)
+
+    var alpha = 0f
+    runOnUiThread { alpha = fabricUIManager.resolveView(42)!!.alpha }
+    assertThat(preallocatedAlpha).isEqualTo(0.2f)
+    assertThat(alpha).isEqualTo(0.7f)
+  }
+
+  /** A covered backend write to a view that is not created yet is mounted when it is created. */
+  @Test
+  fun native_aCoveredWriteReachesAViewCreatedAfterIt() {
+    overrideBackendFlags(
+        accumulatedRawProps = false,
+        sharedAnimatedBackend = true,
+        viewPreallocation = false,
+    )
+    val fabricUIManager = createFabricUIManager()
+    val helper = registerBinding(fabricUIManager)
+    val surfaceId = startSurfaceWithViews(fabricUIManager, helper, intArrayOf())
+    helper.createView(surfaceId, 42, props("opacity" to 0.2))
+    runOnUiThread { helper.writeProps(42, props("opacity" to 0.5, "nativeID" to "written")) }
+
+    thread { helper.commitReactViews(surfaceId, intArrayOf(42)) }.join()
+    dispatchMountItems(fabricUIManager)
+
+    var alpha = 0f
+    var nativeId: Any? = null
+    runOnUiThread {
+      val view = fabricUIManager.resolveView(42)!!
+      alpha = view.alpha
+      nativeId = view.getTag(R.id.view_tag_native_id)
+    }
+    assertThat(alpha).isEqualTo(0.5f)
+    assertThat(nativeId).isEqualTo("written")
+  }
+
+  /** A covered typed write to a view that is not created yet is mounted when it is created. */
+  @Test
+  fun native_aCoveredTypedWriteReachesAViewCreatedAfterIt() {
+    overrideBackendFlags(
+        accumulatedRawProps = false,
+        sharedAnimatedBackend = true,
+        viewPreallocation = false,
+    )
+    val fabricUIManager = createFabricUIManager()
+    val helper = registerBinding(fabricUIManager)
+    val surfaceId = startSurfaceWithViews(fabricUIManager, helper, intArrayOf())
+    helper.createView(surfaceId, 42, props("opacity" to 1.0))
+    helper.createView(surfaceId, 43, props("opacity" to 1.0))
+    runOnUiThread {
+      helper.writeTypedProps(42, props("opacity" to 0.5))
+      helper.writeTypedProps(43, props("marginTop" to 10.0))
+      helper.writeProps(43, props("marginLeft" to 20.0, "opacity" to 0.25))
+    }
+
+    thread { helper.commitReactViews(surfaceId, intArrayOf(42, 43)) }.join()
+    dispatchMountItems(fabricUIManager)
+
+    val alphas = FloatArray(2)
+    runOnUiThread {
+      alphas[0] = fabricUIManager.resolveView(42)!!.alpha
+      alphas[1] = fabricUIManager.resolveView(43)!!.alpha
+    }
+    assertThat(alphas).containsExactly(0.5f, 0.25f)
   }
 }

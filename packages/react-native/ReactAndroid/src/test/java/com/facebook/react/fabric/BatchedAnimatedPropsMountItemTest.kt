@@ -9,7 +9,6 @@ package com.facebook.react.fabric
 
 import com.facebook.react.bridge.JavaOnlyMap
 import com.facebook.react.bridge.ReadableMap
-import com.facebook.react.fabric.mounting.MountItemDispatcher
 import com.facebook.react.fabric.mounting.MountingManager
 import com.facebook.react.fabric.mounting.mountitems.BatchedAnimatedPropsMountItem
 import org.assertj.core.api.Assertions.assertThat
@@ -25,7 +24,7 @@ class BatchedAnimatedPropsMountItemTest {
       rawProps: Array<Any?> = emptyArray(),
   ): List<Pair<Int, ReadableMap>> {
     val updates = mutableListOf<Pair<Int, ReadableMap>>()
-    BatchedAnimatedPropsMountItem(ints, doubles, rawProps, mock()).decode { tag, props ->
+    BatchedAnimatedPropsMountItem(ints, doubles, rawProps).decode { tag, props ->
       updates.add(tag to props)
     }
     return updates
@@ -269,36 +268,9 @@ class BatchedAnimatedPropsMountItemTest {
   }
 
   @Test
-  fun queuesMissingViewsAndContinuesTheBatch() {
-    val manager = mock<MountingManager>()
-    val dispatcher = mock<MountItemDispatcher>()
-    val second = JavaOnlyMap.of("opacity", 0.75)
-    whenever(manager.updateAnimatedPropsSynchronously(12, second)).thenReturn(true)
-    BatchedAnimatedPropsMountItem(
-            intArrayOf(
-                CMD_START_OF_VIEW,
-                11,
-                CMD_OPACITY,
-                CMD_END_OF_VIEW,
-                CMD_START_OF_VIEW,
-                12,
-                CMD_OPACITY,
-                CMD_END_OF_VIEW,
-            ),
-            doubleArrayOf(0.25, 0.75),
-            emptyArray(),
-            dispatcher,
-        )
-        .execute(manager)
-    verify(dispatcher).addMountItem(org.mockito.kotlin.any())
-    verify(manager).updateAnimatedPropsSynchronously(12, second)
-  }
-
-  @Test
   fun continuesAfterOneViewManagerFails() {
     val manager = mock<MountingManager>()
-    val dispatcher = mock<MountItemDispatcher>()
-    whenever(manager.updateAnimatedPropsSynchronously(11, JavaOnlyMap.of("opacity", 0.25)))
+    whenever(manager.updatePropsSynchronously(11, JavaOnlyMap.of("opacity", 0.25)))
         .thenThrow(IllegalStateException("view failure"))
     BatchedAnimatedPropsMountItem(
             intArrayOf(
@@ -313,10 +285,9 @@ class BatchedAnimatedPropsMountItemTest {
             ),
             doubleArrayOf(0.25, 0.75),
             emptyArray(),
-            dispatcher,
         )
         .execute(manager)
-    verify(manager).updateAnimatedPropsSynchronously(12, JavaOnlyMap.of("opacity", 0.75))
+    verify(manager).updatePropsSynchronously(12, JavaOnlyMap.of("opacity", 0.75))
   }
 
   private companion object {
