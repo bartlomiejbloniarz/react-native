@@ -42,6 +42,11 @@ class PropsAnimatedNode final : public AnimatedNode {
     return connectedRootTag_;
   }
 
+  ShadowNodeFamily::Shared shadowNodeFamily() const
+  {
+    return shadowNodeFamily_.lock();
+  }
+
   folly::dynamic props()
   {
     std::lock_guard<std::mutex> lock(propsMutex_);

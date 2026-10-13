@@ -45,4 +45,15 @@ class MountingOverrideDelegate {
       ShadowViewMutationList mutations) const = 0;
 };
 
+/**
+ * The last stage of every pull that returns a transaction, after all
+ * MountingOverrideDelegates. `root` is the tree the transaction mounts.
+ */
+class MountingTransactionFinalizer {
+ public:
+  virtual ~MountingTransactionFinalizer() = default;
+
+  virtual MountingTransaction finalizeTransaction(MountingTransaction transaction, const ShadowNode &root) const = 0;
+};
+
 } // namespace facebook::react

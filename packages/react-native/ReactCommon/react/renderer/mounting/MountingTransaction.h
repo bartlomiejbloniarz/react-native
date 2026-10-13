@@ -37,6 +37,7 @@ class MountingTransaction final {
   struct AnimationStamp {
     size_t firstMutation;
     uint64_t number;
+    uint64_t releaseCoverage;
   };
 
   /*

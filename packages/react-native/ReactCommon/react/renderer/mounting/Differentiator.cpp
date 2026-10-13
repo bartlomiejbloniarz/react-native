@@ -1453,4 +1453,54 @@ ShadowViewMutation::List calculateShadowViewMutations(
   return mutations;
 }
 
+std::optional<MountedShadowView> findMountedShadowView(
+    const ShadowNode& rootShadowNode,
+    const ShadowNodeFamily& family) {
+  auto ancestors = family.getAncestors(rootShadowNode);
+  if (ancestors.empty()) {
+    return std::nullopt;
+  }
+  std::unordered_map<const ShadowNode*, size_t> pathDepths;
+  for (const auto& [parent, index] : ancestors) {
+    pathDepths.emplace(
+        parent.get().getChildren().at(index).get(), pathDepths.size());
+  }
+  ViewNodePairScope scope;
+  Tag parentTag = rootShadowNode.getTag();
+  CullingContext cullingContext;
+  auto pairs = sliceChildShadowNodeViewPairs(
+      ShadowViewNodePair{.shadowNode = &rootShadowNode},
+      scope,
+      false /* allowFlattened */,
+      {} /* layoutOffset */,
+      cullingContext);
+  while (true) {
+    // A layer contains the nodes flattened into it, so the deepest node of the
+    // path in it is either the node itself or the view the path continues in.
+    ShadowViewNodePair* deepestPair = nullptr;
+    size_t deepestDepth = 0;
+    for (auto* pair : pairs) {
+      if (auto it = pathDepths.find(pair->shadowNode); it != pathDepths.end() &&
+          (deepestPair == nullptr || it->second > deepestDepth)) {
+        deepestPair = pair;
+        deepestDepth = it->second;
+      }
+    }
+    if (deepestPair == nullptr || !deepestPair->isConcreteView) {
+      return std::nullopt;
+    }
+    if (deepestDepth == pathDepths.size() - 1) {
+      return MountedShadowView{
+          .parentTag = parentTag, .shadowView = deepestPair->shadowView};
+    }
+    if (deepestPair->flattened) {
+      return std::nullopt;
+    }
+    parentTag = deepestPair->shadowView.tag;
+    cullingContext = cullingContext.adjustCullingContextIfNeeded(*deepestPair);
+    pairs = sliceChildShadowNodeViewPairsFromViewNodePair(
+        *deepestPair, scope, false, cullingContext);
+  }
+}
+
 } // namespace facebook::react

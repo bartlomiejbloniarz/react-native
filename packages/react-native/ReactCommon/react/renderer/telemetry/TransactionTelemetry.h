@@ -53,6 +53,9 @@ class TransactionTelemetry final {
   // The animation backend write number of the animated props the revision
   // carries: it contains every write up to that number.
   void setAnimationStampNumber(uint64_t animationStampNumber);
+  // The newest release of animated props ownership that the revision's React
+  // state contains.
+  void setReleaseCoverage(uint64_t releaseCoverage);
 
   /*
    * Reading
@@ -70,6 +73,7 @@ class TransactionTelemetry final {
   int getNumberOfTextMeasurements() const;
   int getRevisionNumber() const;
   uint64_t getAnimationStampNumber() const;
+  uint64_t getReleaseCoverage() const;
 
   int getAffectedLayoutNodesCount() const;
 
@@ -89,6 +93,7 @@ class TransactionTelemetry final {
   int numberOfTextMeasurements_{0};
   int revisionNumber_{0};
   uint64_t animationStampNumber_{0};
+  uint64_t releaseCoverage_{0};
   std::function<TelemetryTimePoint()> now_;
 
   int affectedLayoutNodesCount_{0};

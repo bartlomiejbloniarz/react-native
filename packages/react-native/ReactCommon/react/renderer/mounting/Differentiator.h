@@ -12,6 +12,8 @@
 #include <React/RendererCore.h>
 #include <react/renderer/mounting/ShadowViewMutation.h>
 
+#include <optional>
+
 namespace facebook::react {
 
 /*
@@ -22,5 +24,19 @@ namespace facebook::react {
 ShadowViewMutation::List calculateShadowViewMutations(
     const ShadowNode &oldRootShadowNode,
     const ShadowNode &newRootShadowNode);
+
+struct MountedShadowView {
+  Tag parentTag;
+  ShadowView shadowView;
+};
+
+/*
+ * The view of `family` that the mutations calculated for the tree of
+ * `rootShadowNode` mount, and the tag of the view it is mounted in; none when
+ * the node is flattened, culled, hidden or not in the tree.
+ */
+std::optional<MountedShadowView> findMountedShadowView(
+    const ShadowNode &rootShadowNode,
+    const ShadowNodeFamily &family);
 
 } // namespace facebook::react

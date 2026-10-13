@@ -33,6 +33,8 @@
 
 namespace facebook::react {
 
+class PropsAnimatedNode;
+
 using TimePointFunction = std::chrono::steady_clock::time_point (*)();
 // A way to inject a custom time function for testing purposes.
 // Default is `std::chrono::steady_clock::now`.
@@ -214,6 +216,7 @@ class NativeAnimatedNodesManager : public std::enable_shared_from_this<NativeAni
   void resolvePlatformColor(SurfaceId surfaceId, const RawValue &value, SharedColor &result) const;
 
  private:
+  void ownDirectProps(PropsAnimatedNode &node, const std::shared_ptr<const ShadowNodeFamily> &family);
   void stopRenderCallbackIfNeeded(bool isAsync) noexcept;
 
   bool onAnimationFrame(double timestamp);
@@ -283,7 +286,8 @@ class NativeAnimatedNodesManager : public std::enable_shared_from_this<NativeAni
   std::unordered_map<Tag, folly::dynamic> updateViewPropsDirect_{};
   std::unordered_map<Tag, std::pair<ShadowNodeFamily::Weak, folly::dynamic>> updateViewPropsForBackend_{};
   std::unordered_map<Tag, std::pair<ShadowNodeFamily::Weak, folly::dynamic>> updateViewPropsDirectForBackend_{};
-  std::unordered_set<Tag> shouldRequestAsyncFlush_{};
+  // The keys of each view whose animation finished in this frame.
+  std::unordered_map<Tag, std::unordered_set<std::string>> finishedKeys_{};
   /*
    * Sometimes a view is not longer connected to a PropsAnimatedNode, but
    * NativeAnimated has previously changed the view's props via direct

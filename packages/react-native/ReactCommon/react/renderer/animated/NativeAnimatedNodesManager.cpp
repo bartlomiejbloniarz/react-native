@@ -17,6 +17,7 @@
 #include <react/renderer/animated/drivers/DecayAnimationDriver.h>
 #include <react/renderer/animated/drivers/FrameAnimationDriver.h>
 #include <react/renderer/animated/drivers/SpringAnimationDriver.h>
+#include <react/renderer/animated/internal/NativeAnimatedAllowlist.h>
 #include <react/renderer/animated/nodes/AdditionAnimatedNode.h>
 #include <react/renderer/animated/nodes/AnimatedNode.h>
 #include <react/renderer/animated/nodes/ColorAnimatedNode.h>
@@ -272,6 +273,7 @@ void NativeAnimatedNodesManager::connectAnimatedNodeToShadowNodeFamily(
   auto node = getAnimatedNode<PropsAnimatedNode>(propsNodeTag);
   if (node != nullptr && family != nullptr) {
     node->connectToShadowNodeFamily(family);
+    ownDirectProps(*node, family);
   } else {
     LOG(WARNING)
         << "Cannot ConnectAnimatedNodeToShadowNodeFamily, animated node has to be props type";
@@ -289,6 +291,9 @@ void NativeAnimatedNodesManager::disconnectAnimatedNodeFromView(
     node->disconnectFromView(viewTag);
     if (useSharedAnimatedBackend_) {
       node->disconnectFromShadowNodeFamily();
+      if (auto animationBackend = animationBackend_.lock()) {
+        animationBackend->release(propsNodeTag);
+      }
     }
     {
       std::lock_guard<std::mutex> lock(connectedAnimatedNodesMutex_);
@@ -324,6 +329,58 @@ void NativeAnimatedNodesManager::disconnectAnimatedNodes(
 void NativeAnimatedNodesManager::restoreDefaultValues(Tag tag) noexcept {
   if (auto propsNode = getAnimatedNode<PropsAnimatedNode>(tag)) {
     propsNode->restoreDefaultValues();
+    if (auto animationBackend = animationBackend_.lock()) {
+      animationBackend->release(tag);
+      if (auto family = propsNode->shadowNodeFamily()) {
+        ownDirectProps(*propsNode, family);
+      }
+    }
+  }
+}
+
+namespace {
+
+// Whether a direct write of the key changes the view: views take sibling order
+// and paragraph text attributes from the shadow tree, and only Android views
+// have elevation and the legacy transform props.
+bool isOwnable(const std::string& key, const ShadowNodeFamily& family) {
+  if (key == "zIndex") {
+    return false;
+  }
+  if (key == "color") {
+    return std::string_view{family.getComponentName()} != "Paragraph";
+  }
+#ifndef ANDROID
+  if (key == "elevation" || key == "scaleX" || key == "scaleY" ||
+      key == "translateX" || key == "translateY") {
+    return false;
+  }
+#endif
+  return true;
+}
+
+} // namespace
+
+void NativeAnimatedNodesManager::ownDirectProps(
+    PropsAnimatedNode& node,
+    const std::shared_ptr<const ShadowNodeFamily>& family) {
+  auto animationBackend = animationBackend_.lock();
+  if (animationBackend == nullptr) {
+    return;
+  }
+  std::vector<std::string> keys;
+  auto props = node.props();
+  for (const auto& [key, _] : props.items()) {
+    // Props written through commits are never owned.
+    if (!getDirectManipulationAllowlist().contains(key.getString())) {
+      return;
+    }
+    if (isOwnable(key.getString(), *family)) {
+      keys.push_back(key.getString());
+    }
+  }
+  if (!keys.empty()) {
+    animationBackend->own(family, node.tag(), keys);
   }
 }
 
@@ -978,7 +1035,10 @@ void NativeAnimatedNodesManager::schedulePropsCommit(
     ShadowNodeFamily::Weak shadowNodeFamily) noexcept {
   if (useSharedAnimatedBackend_) {
     if (forceFabricCommit) {
-      shouldRequestAsyncFlush_.insert(viewTag);
+      auto& finishedKeys = finishedKeys_[viewTag];
+      for (const auto& [key, _] : props.items()) {
+        finishedKeys.insert(key.getString());
+      }
     }
     auto& current = layoutStyleUpdated
         ? updateViewPropsForBackend_[viewTag]
@@ -1020,16 +1080,20 @@ void NativeAnimatedNodesManager::insertMutations(
     auto weakFamily = update.first;
 
     if (auto family = weakFamily.lock()) {
-      propsBuilder.storeDynamic(update.second);
-      if (shouldRequestAsyncFlush_.contains(tag)) {
+      std::unordered_set<std::string> finishedKeys;
+      if (auto finishedIt = finishedKeys_.find(tag);
+          finishedIt != finishedKeys_.end()) {
         mutations.asyncFlushSurfaces.insert(family->getSurfaceId());
+        finishedKeys = finishedIt->second;
       }
+      propsBuilder.storeDynamic(update.second);
       mutations.batch.push_back(
           AnimationMutation{
               .tag = tag,
               .family = family,
               .props = propsBuilder.get(),
               .hasLayoutUpdates = hasLayoutUpdates,
+              .finishedKeys = std::move(finishedKeys),
           });
     }
   }
@@ -1150,7 +1214,7 @@ AnimationMutations NativeAnimatedNodesManager::pullAnimationMutations(
     // There is no active animation. Stop the render callback.
     stopRenderCallbackIfNeeded(false);
   }
-  shouldRequestAsyncFlush_.clear();
+  finishedKeys_.clear();
   return mutations;
 }
 

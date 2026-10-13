@@ -325,9 +325,13 @@ FabricUIManagerBinding::newerDirectWrites(
   }
   auto views = animatedViews->getRegion(0, animatedViews->size());
   auto stamps = animationStamps->getRegion(0, animationStamps->size());
-  std::vector<std::pair<Tag, uint64_t>> stampedViews;
+  std::vector<StampedView> stampedViews;
   for (jsize i = 0; i + 1 < animatedViews->size(); i += 2) {
-    stampedViews.emplace_back(views[i], stamps[views[i + 1]]);
+    auto group = 2 * views[i + 1];
+    stampedViews.push_back(
+        {.tag = views[i],
+         .stamp = static_cast<uint64_t>(stamps[group]),
+         .releaseCoverage = static_cast<uint64_t>(stamps[group + 1])});
   }
   auto values = animationBackend->newerDirectWrites(surfaceId, stampedViews);
   if (values.empty()) {

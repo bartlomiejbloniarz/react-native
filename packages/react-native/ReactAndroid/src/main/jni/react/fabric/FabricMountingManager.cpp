@@ -62,6 +62,7 @@ void FabricMountingManager::onSurfaceStart(SurfaceId surfaceId) {
 void FabricMountingManager::onSurfaceStop(SurfaceId surfaceId) {
   std::lock_guard lock(allocatedViewsMutex_);
   allocatedViewRegistry_.erase(surfaceId);
+  serializedReleaseCoverages_.erase(surfaceId);
 }
 
 void FabricMountingManager::onTransactionAvailable(SurfaceId surfaceId) {
@@ -687,11 +688,15 @@ void FabricMountingManager::executeMount(
       mountItem.animationStampIndex = static_cast<int>(animationStampIndex);
       return mountItem;
     };
+    // The release coverage of the group serialized before the current one.
+    auto& serializedReleaseCoverage = serializedReleaseCoverages_[surfaceId];
     for (size_t mutationIndex = 0; mutationIndex < mutations.size();
          mutationIndex++) {
       while (animationStampIndex + 1 < animationStamps.size() &&
              animationStamps[animationStampIndex + 1].firstMutation <=
                  mutationIndex) {
+        serializedReleaseCoverage =
+            animationStamps[animationStampIndex].releaseCoverage;
         animationStampIndex++;
       }
       const auto& mutation = mutations[mutationIndex];
@@ -744,11 +749,28 @@ void FabricMountingManager::executeMount(
             }
 
             if (oldChildShadowView.props != newChildShadowView.props) {
+              auto mountItem = inAnimationStamp(
+                  CppMountItem::UpdatePropsMountItem(
+                      oldChildShadowView, newChildShadowView));
+              // The first group whose React state contains a release sends
+              // React's values of the released props.
+              auto releaseCoverage =
+                  animationStamps[animationStampIndex].releaseCoverage;
+              if (animationBackend != nullptr &&
+                  releaseCoverage > serializedReleaseCoverage) {
+                auto releasedValues = animationBackend->releasedValues(
+                    surfaceId,
+                    newChildShadowView.tag,
+                    serializedReleaseCoverage,
+                    releaseCoverage,
+                    newChildShadowView.props);
+                if (!releasedValues.empty()) {
+                  mountItem.restoredValues = std::move(releasedValues);
+                }
+              }
               (maintainMutationOrder ? cppCommonMountItems
                                      : cppUpdatePropsMountItems)
-                  .push_back(inAnimationStamp(
-                      CppMountItem::UpdatePropsMountItem(
-                          oldChildShadowView, newChildShadowView)));
+                  .push_back(std::move(mountItem));
             }
             if (oldChildShadowView.state != newChildShadowView.state) {
               (maintainMutationOrder ? cppCommonMountItems
@@ -947,6 +969,9 @@ void FabricMountingManager::executeMount(
         }
       }
     }
+    if (!animationStamps.empty()) {
+      serializedReleaseCoverage = animationStamps.back().releaseCoverage;
+    }
   }
 
   // We now have all the information we need, including ordering of mount items,
@@ -1144,6 +1169,7 @@ void FabricMountingManager::executeMount(
     std::vector<jlong> stampNumbers;
     for (const auto& stamp : transaction.getAnimationStamps()) {
       stampNumbers.push_back(static_cast<jlong>(stamp.number));
+      stampNumbers.push_back(static_cast<jlong>(stamp.releaseCoverage));
     }
     animationStamps = jni::JArrayLong::newArray(stampNumbers.size());
     animationStamps->setRegion(

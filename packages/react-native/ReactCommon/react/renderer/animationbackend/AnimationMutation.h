@@ -7,6 +7,9 @@
 
 #pragma once
 
+#include <string>
+#include <unordered_set>
+
 #include <react/cxxstableapi/FrameworksGuard.h>
 
 #include <React/RendererCore.h>
@@ -22,6 +25,8 @@ struct AnimationMutation {
   std::shared_ptr<const ShadowNodeFamily> family;
   AnimatedProps props;
   bool hasLayoutUpdates{false};
+  // The raw props keys whose animation finished with this write.
+  std::unordered_set<std::string> finishedKeys;
 };
 
 struct AnimationMutations {

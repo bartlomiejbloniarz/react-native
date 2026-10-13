@@ -17,6 +17,7 @@
 #include <cstdint>
 #include <functional>
 #include <memory>
+#include <string>
 #include <utility>
 #include <vector>
 
@@ -26,6 +27,14 @@ struct AnimationMutations;
 
 using AnimationTimestamp = std::chrono::duration<double, std::milli>;
 using CallbackId = uint64_t;
+
+// A view mounted by a revision with this animation stamp and release
+// coverage.
+struct StampedView {
+  Tag tag;
+  uint64_t stamp;
+  uint64_t releaseCoverage;
+};
 
 class UIManagerAnimationBackend {
  public:
@@ -46,7 +55,7 @@ class UIManagerAnimationBackend {
   // mount's values; empty when the surface has no direct writes.
   virtual std::vector<folly::dynamic> newerDirectWrites(
       SurfaceId /*surfaceId*/,
-      const std::vector<std::pair<Tag, uint64_t>> & /*stampedViews*/)
+      const std::vector<StampedView> & /*stampedViews*/)
   {
     return {};
   }
@@ -66,6 +75,27 @@ class UIManagerAnimationBackend {
   {
     return folly::dynamic::object();
   }
+  // The values `props` gives the keys whose owning C++ Animated node was
+  // released after `afterReleaseCoverage` and up to `releaseCoverage`.
+  virtual folly::dynamic releasedValues(
+      SurfaceId /*surfaceId*/,
+      Tag /*tag*/,
+      uint64_t /*afterReleaseCoverage*/,
+      uint64_t /*releaseCoverage*/,
+      const Props::Shared & /*props*/)
+  {
+    return folly::dynamic::object();
+  }
+  // A C++ Animated props node owns `keys` of the view: nothing else changes
+  // them until the node releases them.
+  virtual void own(
+      const std::shared_ptr<const ShadowNodeFamily> & /*family*/,
+      Tag /*propsNodeTag*/,
+      const std::vector<std::string> & /*keys*/)
+  {
+  }
+  // Releases the keys the node owns; React's values are then mounted again.
+  virtual void release(Tag /*propsNodeTag*/) {}
 };
 
 } // namespace facebook::react

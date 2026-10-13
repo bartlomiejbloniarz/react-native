@@ -20,7 +20,10 @@ MountingTransaction::MountingTransaction(
       number_(number),
       mutations_(std::move(mutations)),
       telemetry_(std::move(telemetry)),
-      animationStamps_{{0, telemetry_.getAnimationStampNumber()}} {}
+      animationStamps_{
+          {0,
+           telemetry_.getAnimationStampNumber(),
+           telemetry_.getReleaseCoverage()}} {}
 
 const ShadowViewMutationList& MountingTransaction::getMutations() const& {
   return mutations_;
@@ -52,7 +55,9 @@ void MountingTransaction::mergeWith(MountingTransaction&& transaction) {
   number_ = transaction.getNumber();
   for (const auto& stamp : transaction.animationStamps_) {
     animationStamps_.push_back(
-        {mutations_.size() + stamp.firstMutation, stamp.number});
+        {mutations_.size() + stamp.firstMutation,
+         stamp.number,
+         stamp.releaseCoverage});
   }
   mutations_.insert(
       mutations_.end(),

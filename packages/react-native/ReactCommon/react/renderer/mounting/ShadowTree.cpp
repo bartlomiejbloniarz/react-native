@@ -63,6 +63,8 @@ std::string getShadowTreeCommitSourceName(ShadowTreeCommitSource source) {
       return "AnimationEndSync";
     case ShadowTreeCommitSource::ReactRevisionMerge:
       return "ReactRevisionMerge";
+    case ShadowTreeCommitSource::AnimatedPropsRelease:
+      return "AnimatedPropsRelease";
   }
 }
 
@@ -375,7 +377,8 @@ CommitStatus ShadowTree::tryCommit(
 
   auto isReactBranch = ReactNativeFeatureFlags::enableFabricCommitBranching() &&
       (commitOptions.source == CommitSource::React ||
-       commitOptions.source == CommitSource::AnimationEndSync);
+       commitOptions.source == CommitSource::AnimationEndSync ||
+       commitOptions.source == CommitSource::AnimatedPropsRelease);
 
   // Commits on the JS branch are never synchronous.
   react_native_assert(!isReactBranch || !commitOptions.mountSynchronously);
@@ -402,8 +405,18 @@ CommitStatus ShadowTree::tryCommit(
     oldRevisionForStateProgression = currentRevision_;
   }
 
+  // A revision carries the stamp and the release coverage of the one it is
+  // built on, unless its transaction or a commit hook sets them on the
+  // thread-local telemetry.
+  telemetry.setAnimationStampNumber(
+      oldRevision.telemetry.getAnimationStampNumber());
+  telemetry.setReleaseCoverage(oldRevision.telemetry.getReleaseCoverage());
   const auto& oldRootShadowNode = oldRevision.rootShadowNode;
-  auto newRootShadowNode = transaction(*oldRevision.rootShadowNode);
+  RootShadowNode::Unshared newRootShadowNode;
+  {
+    ThreadLocalTelemetryScope telemetryScope{telemetry};
+    newRootShadowNode = transaction(*oldRevision.rootShadowNode);
+  }
 
   if (!newRootShadowNode) {
     return CommitStatus::Cancelled;
@@ -425,11 +438,6 @@ CommitStatus ShadowTree::tryCommit(
         commitOptions);
   }
 
-  // Run commit hooks. A hook that stamps animated props into the new root
-  // sets the revision's stamp number on the thread-local telemetry; otherwise
-  // the revision carries the stamp of the one it is built on.
-  telemetry.setAnimationStampNumber(
-      oldRevision.telemetry.getAnimationStampNumber());
   {
     ThreadLocalTelemetryScope telemetryScope{telemetry};
     newRootShadowNode = delegate_.shadowTreeWillCommit(
@@ -563,6 +571,8 @@ void ShadowTree::mergeReactRevision() const {
     auto status = this->commit(
         [revision = std::move(promotedRevision)](
             const RootShadowNode& /*oldRootShadowNode*/) {
+          TransactionTelemetry::threadLocalTelemetry()->setReleaseCoverage(
+              revision.telemetry.getReleaseCoverage());
           return std::make_shared<RootShadowNode>(
               *revision.rootShadowNode, ShadowNodeFragment{});
         },
@@ -581,6 +591,8 @@ void ShadowTree::mergeReactRevision() const {
       auto status = this->commit(
           [revision = std::move(revision)](
               const RootShadowNode& /*oldRootShadowNode*/) {
+            TransactionTelemetry::threadLocalTelemetry()->setReleaseCoverage(
+                revision.telemetry.getReleaseCoverage());
             return std::make_shared<RootShadowNode>(
                 *revision.rootShadowNode, ShadowNodeFragment{});
           },

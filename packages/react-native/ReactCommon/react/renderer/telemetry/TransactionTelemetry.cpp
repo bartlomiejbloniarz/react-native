@@ -110,6 +110,10 @@ void TransactionTelemetry::setAnimationStampNumber(
   animationStampNumber_ = animationStampNumber;
 }
 
+void TransactionTelemetry::setReleaseCoverage(uint64_t releaseCoverage) {
+  releaseCoverage_ = releaseCoverage;
+}
+
 TelemetryTimePoint TransactionTelemetry::getDiffStartTime() const {
   react_native_assert(diffStartTime_ != kTelemetryUndefinedTimePoint);
   react_native_assert(diffEndTime_ != kTelemetryUndefinedTimePoint);
@@ -172,6 +176,10 @@ int TransactionTelemetry::getRevisionNumber() const {
 
 uint64_t TransactionTelemetry::getAnimationStampNumber() const {
   return animationStampNumber_;
+}
+
+uint64_t TransactionTelemetry::getReleaseCoverage() const {
+  return releaseCoverage_;
 }
 
 int TransactionTelemetry::getAffectedLayoutNodesCount() const {

@@ -124,6 +124,8 @@ std::optional<MountingTransaction> MountingCoordinator::pullTransaction(
             lastRevision_.has_value() ? *lastRevision_ : baseRevision_;
         telemetry.setAnimationStampNumber(
             coveringRevision.telemetry.getAnimationStampNumber());
+        telemetry.setReleaseCoverage(
+            coveringRevision.telemetry.getReleaseCoverage());
         telemetry.willLayout();
         telemetry.didLayout();
         telemetry.willCommit();
@@ -140,14 +142,12 @@ std::optional<MountingTransaction> MountingCoordinator::pullTransaction(
     }
   }
 
-  auto finalDelegate = finalMountingOverrideDelegate_.lock();
-  if (transaction.has_value() && finalDelegate &&
-      finalDelegate->shouldOverridePullTransaction()) {
-    transaction = finalDelegate->pullTransaction(
-        surfaceId_,
-        transaction->getNumber(),
-        transaction->getTelemetry(),
-        transaction->getMutations());
+  const auto& root = lastRevision_.has_value() ? lastRevision_->rootShadowNode
+                                               : baseRevision_.rootShadowNode;
+  if (auto finalizer = transactionFinalizer_.lock();
+      finalizer && transaction.has_value() && root) {
+    transaction =
+        finalizer->finalizeTransaction(std::move(*transaction), *root);
 #ifdef RN_SHADOW_TREE_INTROSPECTION
     didOverridePullTransaction = true;
 #endif
@@ -238,10 +238,10 @@ void MountingCoordinator::setMountingOverrideDelegate(
       mountingOverrideDelegates_.end(), std::move(delegate));
 }
 
-void MountingCoordinator::setFinalMountingOverrideDelegate(
-    std::weak_ptr<const MountingOverrideDelegate> delegate) const {
+void MountingCoordinator::setTransactionFinalizer(
+    std::weak_ptr<const MountingTransactionFinalizer> finalizer) const {
   std::scoped_lock lock(mutex_);
-  finalMountingOverrideDelegate_ = std::move(delegate);
+  transactionFinalizer_ = std::move(finalizer);
 }
 
 } // namespace facebook::react

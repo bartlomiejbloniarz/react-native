@@ -52,6 +52,7 @@ enum class ShadowTreeCommitSource {
   React,
   AnimationEndSync,
   ReactRevisionMerge,
+  AnimatedPropsRelease,
 };
 
 struct ShadowTreeCommitOptions {

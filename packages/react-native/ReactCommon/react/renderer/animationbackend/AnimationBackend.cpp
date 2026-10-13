@@ -67,6 +67,7 @@ static void mergeMutation(
     }
   }
   existing.hasLayoutUpdates |= incoming.hasLayoutUpdates;
+  existing.finishedKeys.merge(incoming.finishedKeys);
 }
 
 // Typed props set per edge or corner become raw props, which, like the
@@ -107,7 +108,7 @@ AnimationBackend::AnimationBackend(
       [weakAnimatedPropsRegistry](const ShadowTree& shadowTree) {
         if (auto animatedPropsRegistry = weakAnimatedPropsRegistry.lock()) {
           animatedPropsRegistry->initializeSurface(shadowTree.getSurfaceId());
-          shadowTree.getMountingCoordinator()->setFinalMountingOverrideDelegate(
+          shadowTree.getMountingCoordinator()->setTransactionFinalizer(
               animatedPropsRegistry);
         }
       };
@@ -156,6 +157,10 @@ void AnimationBackend::applySurfaceUpdates(
                 .props = {},
                 .rawProps = std::make_unique<RawProps>(
                     animationbackend::packAnimatedProps(mutation.props))});
+        // Owned props stay out of the shadow tree, which keeps React's values
+        // for when they are released.
+        animatedPropsRegistry_->removeOwnedProps(
+            surfaceId, tag, mutation.props);
         layoutUpdates.emplace(tag, std::move(mutation));
       } else {
         directProps.emplace(tag, std::move(mutation.props));
@@ -173,6 +178,7 @@ void AnimationBackend::applySurfaceUpdates(
 }
 
 void AnimationBackend::applyMutations(std::vector<AnimationMutations> batches) {
+  requestReleaseCommit();
   std::unordered_map<SurfaceId, SurfaceUpdates> surfaceUpdates;
   std::set<SurfaceId> asyncFlushSurfaces;
   for (auto& mutations : batches) {
@@ -347,8 +353,162 @@ void AnimationBackend::requestAsyncFlushForSurfaces(
 
 std::vector<folly::dynamic> AnimationBackend::newerDirectWrites(
     SurfaceId surfaceId,
-    const std::vector<std::pair<Tag, uint64_t>>& stampedViews) {
+    const std::vector<StampedView>& stampedViews) {
   return animatedPropsRegistry_->newerDirectWrites(surfaceId, stampedViews);
+}
+
+void AnimationBackend::own(
+    const std::shared_ptr<const ShadowNodeFamily>& family,
+    Tag propsNodeTag,
+    const std::vector<std::string>& keys) {
+  animatedPropsRegistry_->own(family, propsNodeTag, keys);
+}
+
+void AnimationBackend::release(Tag propsNodeTag) {
+  if (auto connection = animatedPropsRegistry_->disconnect(propsNodeTag)) {
+    std::lock_guard lock(releasesMutex_);
+    releasedConnections_.push_back(*connection);
+  }
+}
+
+void AnimationBackend::requestReleaseCommit() {
+  std::vector<uint64_t> connections;
+  {
+    std::lock_guard lock(releasesMutex_);
+    connections.swap(releasedConnections_);
+  }
+  if (connections.empty() || jsInvoker_ == nullptr) {
+    return;
+  }
+  // Releases are committed on the JS thread, in order with React and end
+  // sync commits.
+  jsInvoker_->invokeAsync(
+      [weakThis = weak_from_this(), connections = std::move(connections)]() {
+        if (auto self = weakThis.lock()) {
+          self->commitPendingReleases();
+          self->commitReleases(connections);
+          self->stopReleaseRetriesIfIdle();
+        }
+      });
+}
+
+void AnimationBackend::commitReleases(
+    const std::vector<uint64_t>& connections) {
+  for (auto surfaceId : animatedPropsRegistry_->surfacesOf(connections)) {
+    auto [releaseNumber, families] =
+        animatedPropsRegistry_->releaseOnSurface(surfaceId, connections);
+    if (!families.empty()) {
+      commitRelease(
+          {.surfaceId = surfaceId,
+           .releaseNumber = releaseNumber,
+           .families = {families.begin(), families.end()}});
+    }
+  }
+}
+
+void AnimationBackend::commitPendingReleases() {
+  std::vector<ReleaseCommit> pendingCommits;
+  {
+    std::lock_guard lock(releasesMutex_);
+    pendingCommits.swap(pendingReleaseCommits_);
+  }
+  for (const auto& releaseCommit : pendingCommits) {
+    commitRelease(releaseCommit);
+  }
+}
+
+void AnimationBackend::requestReleaseRetry() {
+  {
+    std::lock_guard lock(releasesMutex_);
+    if (isReleaseRetryRequested_ || pendingReleaseCommits_.empty()) {
+      return;
+    }
+    isReleaseRetryRequested_ = true;
+  }
+  jsInvoker_->invokeAsync([weakThis = weak_from_this()]() {
+    if (auto self = weakThis.lock()) {
+      {
+        std::lock_guard lock(self->releasesMutex_);
+        self->isReleaseRetryRequested_ = false;
+      }
+      self->commitPendingReleases();
+      self->stopReleaseRetriesIfIdle();
+    }
+  });
+}
+
+void AnimationBackend::stopReleaseRetriesIfIdle() {
+  std::lock_guard lock(releasesMutex_);
+  if (pendingReleaseCommits_.empty() && releaseRetryCallbackId_) {
+    stop(*std::exchange(releaseRetryCallbackId_, std::nullopt));
+  }
+}
+
+void AnimationBackend::commitRelease(const ReleaseCommit& releaseCommit) {
+  auto uiManager = uiManager_.lock();
+  if (!uiManager) {
+    return;
+  }
+  const auto& [surfaceId, releaseNumber, weakFamilies] = releaseCommit;
+  std::vector<std::shared_ptr<const ShadowNodeFamily>> families;
+  for (const auto& weakFamily : weakFamilies) {
+    if (auto family = weakFamily.lock()) {
+      families.push_back(std::move(family));
+    }
+  }
+  if (families.empty()) {
+    return;
+  }
+  auto status = ShadowTree::CommitStatus::Succeeded;
+  uiManager->getShadowTreeRegistry().visit(
+      surfaceId, [&](const ShadowTree& shadowTree) {
+        status = shadowTree.commit(
+            [&](const RootShadowNode& oldRootShadowNode) {
+              auto* telemetry = TransactionTelemetry::threadLocalTelemetry();
+              telemetry->setReleaseCoverage(
+                  std::max(telemetry->getReleaseCoverage(), releaseNumber));
+              auto root = std::static_pointer_cast<RootShadowNode>(
+                  oldRootShadowNode.ShadowNode::clone({}));
+              for (const auto& family : families) {
+                auto clonedRoot = root->cloneTree(
+                    *family, [&](const ShadowNode& oldShadowNode) {
+                      PropsParserContext propsParserContext{
+                          surfaceId, *oldShadowNode.getContextContainer()};
+                      return oldShadowNode.clone(
+                          {.props = oldShadowNode.getComponentDescriptor()
+                                        .cloneProps(
+                                            propsParserContext,
+                                            oldShadowNode.getProps(),
+                                            {})});
+                    });
+                if (clonedRoot) {
+                  root = std::static_pointer_cast<RootShadowNode>(clonedRoot);
+                }
+              }
+              return root;
+            },
+            {.mountSynchronously = false,
+             .source = ShadowTreeCommitSource::AnimatedPropsRelease});
+      });
+  if (status == ShadowTree::CommitStatus::Succeeded) {
+    return;
+  }
+  // Until a revision carries the release, its owned writes keep winning: it is
+  // retried once a frame, and frames run while releases are pending.
+  std::lock_guard lock(releasesMutex_);
+  pendingReleaseCommits_.push_back(
+      {.surfaceId = surfaceId,
+       .releaseNumber = releaseNumber,
+       .families = {families.begin(), families.end()}});
+  if (!releaseRetryCallbackId_) {
+    releaseRetryCallbackId_ =
+        start([weakThis = weak_from_this()](AnimationTimestamp /*timestamp*/) {
+          if (auto self = weakThis.lock()) {
+            self->requestReleaseRetry();
+          }
+          return AnimationMutations{};
+        });
+  }
 }
 
 bool AnimationBackend::hasDirectWrites(SurfaceId surfaceId) {
@@ -356,6 +516,16 @@ bool AnimationBackend::hasDirectWrites(SurfaceId surfaceId) {
 }
 
 #ifdef RN_SERIALIZABLE_STATE
+folly::dynamic AnimationBackend::releasedValues(
+    SurfaceId surfaceId,
+    Tag tag,
+    uint64_t afterReleaseCoverage,
+    uint64_t releaseCoverage,
+    const Props::Shared& props) {
+  return animatedPropsRegistry_->releasedValues(
+      surfaceId, tag, afterReleaseCoverage, releaseCoverage, props);
+}
+
 folly::dynamic AnimationBackend::restoreDirectWrites(
     SurfaceId surfaceId,
     Tag tag,
@@ -371,6 +541,13 @@ void AnimationBackend::clearRegistry(SurfaceId surfaceId) {
 }
 
 void AnimationBackend::clearRegistryOnSurfaceStop(SurfaceId surfaceId) {
+  {
+    std::lock_guard lock(releasesMutex_);
+    std::erase_if(pendingReleaseCommits_, [&](const auto& releaseCommit) {
+      return releaseCommit.surfaceId == surfaceId;
+    });
+  }
+  stopReleaseRetriesIfIdle();
   animatedPropsRegistry_->clearOnSurfaceStop(surfaceId);
 }
 

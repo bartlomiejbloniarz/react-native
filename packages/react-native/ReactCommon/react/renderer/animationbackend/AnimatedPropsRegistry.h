@@ -29,9 +29,31 @@ struct PropsSnapshot {
   std::unique_ptr<folly::dynamic> rawProps;
 };
 
+struct RecordedWrite {
+  uint64_t number;
+  folly::dynamic value;
+  // The ownership connection that wrote an owned key, 0 for others.
+  uint64_t connection;
+};
+
+// The final values of a view's owned props whose animation finished, which
+// the next end sync commits.
+struct EndSyncValues {
+  std::weak_ptr<const ShadowNodeFamily> family;
+  std::unordered_map<std::string, RecordedWrite> values;
+};
+
 struct SurfaceContext {
   std::unordered_map<Tag, std::unique_ptr<PropsSnapshot>> pendingMap, map;
   std::unordered_set<std::shared_ptr<const ShadowNodeFamily>> pendingFamilies, families;
+  std::unordered_map<Tag, EndSyncValues> endSyncValues;
+  // The write number of the last end sync snapshot.
+  uint64_t endSyncNumber{0};
+  // The release coverage of the newest transaction pulled for the surface.
+  uint64_t pulledReleaseCoverage{0};
+  // The views released with written owned props after the pulled release
+  // coverage, with their release numbers, in release order.
+  std::vector<std::pair<uint64_t, std::weak_ptr<const ShadowNodeFamily>>> releasedFamilies;
 };
 
 using SnapshotMap = std::unordered_map<Tag, std::unique_ptr<PropsSnapshot>>;
@@ -48,9 +70,20 @@ struct StampingSnapshot {
 // of the frame that wrote it.
 struct DirectWrites {
   std::weak_ptr<const ShadowNodeFamily> family;
-  std::unordered_map<std::string, std::pair<uint64_t, folly::dynamic>> rawProps;
+  std::unordered_map<std::string, RecordedWrite> rawProps;
   std::unordered_map<PropName, uint64_t> typedPropNumbers;
   std::unique_ptr<BaseViewProps> typedProps;
+  // Owned key -> the connection that owns it.
+  std::unordered_map<std::string, uint64_t> ownedKeys;
+};
+
+// A C++ Animated props node owning keys of a view, from `own` until released.
+struct OwnershipConnection {
+  SurfaceId surfaceId;
+  std::weak_ptr<const ShadowNodeFamily> family;
+  Tag propsNodeTag;
+  // The release sequence number, 0 while owned.
+  uint64_t releasedAt{0};
 };
 
 /*
@@ -70,8 +103,9 @@ folly::dynamic restoreValues(
 #endif
 
 // A mount of a revision stamped before a direct write keeps the written
-// props: a direct write wins when its number is greater than the stamp.
-class AnimatedPropsRegistry : public MountingOverrideDelegate {
+// props: a direct write wins when its number is greater than the stamp. An
+// owned key's write wins until a revision covering its release is mounted.
+class AnimatedPropsRegistry : public MountingTransactionFinalizer {
  public:
   // Records a frame's mutations, merged per view, and returns the frame's
   // write number.
@@ -79,11 +113,25 @@ class AnimatedPropsRegistry : public MountingOverrideDelegate {
   void initializeSurface(SurfaceId surfaceId);
   void clear(SurfaceId surfaceId);
   void clearOnSurfaceStop(SurfaceId surfaceId);
-  StampingSnapshot takeStampingSnapshot(SurfaceId surfaceId);
+  // With `endSync`, the snapshot includes the finished owned values.
+  StampingSnapshot takeStampingSnapshot(SurfaceId surfaceId, bool endSync);
 
-  std::vector<folly::dynamic> newerDirectWrites(
+  void
+  own(const std::shared_ptr<const ShadowNodeFamily> &family, Tag propsNodeTag, const std::vector<std::string> &keys);
+  // Ends the props node's connection, returning it for its release.
+  std::optional<uint64_t> disconnect(Tag propsNodeTag);
+  std::vector<SurfaceId> surfacesOf(const std::vector<uint64_t> &connections) const;
+  // Releases the keys the connections own on a surface at a new release
+  // sequence number, which it returns with the families of the views whose
+  // released keys were written.
+  std::pair<uint64_t, std::vector<std::shared_ptr<const ShadowNodeFamily>>> releaseOnSurface(
       SurfaceId surfaceId,
-      const std::vector<std::pair<Tag, uint64_t>> &stampedViews) const;
+      const std::vector<uint64_t> &connections);
+  // Removes the props of the view's owned keys, raw and typed.
+  void removeOwnedProps(SurfaceId surfaceId, Tag tag, AnimatedProps &props) const;
+
+  std::vector<folly::dynamic> newerDirectWrites(SurfaceId surfaceId, const std::vector<StampedView> &stampedViews)
+      const;
   bool hasDirectWrites(SurfaceId surfaceId) const;
 #ifdef RN_SERIALIZABLE_STATE
   folly::dynamic restoreDirectWrites(
@@ -91,22 +139,50 @@ class AnimatedPropsRegistry : public MountingOverrideDelegate {
       Tag tag,
       const Props::Shared &props,
       const Props::Shared &preallocatedProps) const;
+  // The values `props` gives the keys whose owning connection was released
+  // after `afterReleaseCoverage` and up to `releaseCoverage`.
+  folly::dynamic releasedValues(
+      SurfaceId surfaceId,
+      Tag tag,
+      uint64_t afterReleaseCoverage,
+      uint64_t releaseCoverage,
+      const Props::Shared &props) const;
 #endif
 
-  bool shouldOverridePullTransaction() const override;
-  std::optional<MountingTransaction> pullTransaction(
-      SurfaceId surfaceId,
-      MountingTransaction::Number number,
-      const TransactionTelemetry &telemetry,
-      ShadowViewMutationList mutations) const override;
+  MountingTransaction finalizeTransaction(MountingTransaction transaction, const ShadowNode &root) const override;
 
  private:
-  void recordDirectWrite(const AnimationMutation &mutation, const folly::dynamic *rawProps);
-  folly::dynamic newerDirectWrites(const DirectWrites &view, uint64_t stampNumber) const;
+  friend class AnimatedPropsRegistryTest;
 
-  std::unordered_map<SurfaceId, SurfaceContext> surfaceContexts_;
+  // Records owned typed values as raw values, with the connection that owns
+  // them.
+  void recordDirectWrite(
+      const AnimationMutation &mutation,
+      const folly::dynamic *rawProps,
+      const folly::dynamic &ownedTypedValues);
+  bool isConnected(uint64_t connection) const;
+  // Erases the connection unless its node is connected or it owns or wrote a
+  // key of its view.
+  void eraseIfUnreferenced(uint64_t connection);
+  // The view's owned keys and their connections.
+  std::unordered_map<std::string, uint64_t> ownedKeys(SurfaceId surfaceId, Tag tag) const;
+  // Erases the keys' values from the stamping snapshots and the end sync
+  // values of the view.
+  void eraseOwnedKeys(SurfaceContext &surfaceContext, Tag tag, const std::vector<std::string> &keys);
+  // The values of the view's writes that win against a mount of `group`;
+  // all recorded values without one.
+  folly::dynamic newerDirectWrites(const DirectWrites &view, const std::optional<StampedView> &group) const;
+  bool wins(const RecordedWrite &write, const StampedView &group) const;
+  void overlayNewerDirectWrites(SurfaceId surfaceId, ShadowViewMutationList &mutations, const StampedView &group) const;
+
+  // Mutable for the pulled release coverage the finalizer tracks.
+  mutable std::unordered_map<SurfaceId, SurfaceContext> surfaceContexts_;
   std::unordered_map<SurfaceId, std::unordered_map<Tag, DirectWrites>> directWrites_;
+  std::unordered_map<uint64_t, OwnershipConnection> connections_;
+  std::unordered_map<Tag, uint64_t> nodeConnections_;
   uint64_t writeNumber_{0};
+  uint64_t connectionNumber_{0};
+  uint64_t releaseNumber_{0};
   mutable std::mutex mutex_;
 };
 

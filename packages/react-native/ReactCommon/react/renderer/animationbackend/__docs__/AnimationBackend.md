@@ -88,6 +88,23 @@ view with records is inserted on Android, its recorded props are also sent with
 React's values, so a view written to before its insertion shows the mounted
 values.
 
+C++ Animated owns the props its nodes write directly: nothing else changes them
+until the node is disconnected or its values are restored. Owned writes win at
+every mount and are left out of the props React commits stamp, except the final
+values of finished animations, which the end sync commits. An end sync commits
+the final values its snapshot took, even when their prop gets a new owner
+before the commit is accepted. A node connected to a prop that a still
+connected node wrote takes over the written value; a disconnected node's value
+is released instead.
+
+After each frame, the releases its operations requested are committed on the JS
+thread: the written released views get fresh props and the commit a new release
+number. A release commit that is not accepted stays pending and is retried in at
+most one JS task per frame; frames keep running while releases are pending. A
+mount covering the release number applies React's values again: on Android the
+first such mount sends them for the released keys, and every pull updates
+released views its transaction would not otherwise update.
+
 Additionally, in the callback registered in `start`, one can return a list of
 surfaces that should perform a commit on the JS thread, to have the RSNRU
 propagate the updates to React. This was used by Animated before the backend was

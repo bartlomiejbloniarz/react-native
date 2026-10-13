@@ -48,8 +48,9 @@ RootShadowNode::Unshared AnimationBackendCommitHook::shadowTreeWillCommit(
     return newRootShadowNode;
   }
 
-  auto snapshot =
-      animatedPropsRegistry_->takeStampingSnapshot(shadowTree.getSurfaceId());
+  auto snapshot = animatedPropsRegistry_->takeStampingSnapshot(
+      shadowTree.getSurfaceId(),
+      commitOptions.source == ShadowTreeCommitSource::AnimationEndSync);
   if (auto* telemetry = TransactionTelemetry::threadLocalTelemetry()) {
     telemetry->setAnimationStampNumber(snapshot.number);
   }

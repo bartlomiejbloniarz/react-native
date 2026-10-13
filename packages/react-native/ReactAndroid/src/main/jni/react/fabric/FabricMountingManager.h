@@ -110,6 +110,10 @@ class FabricMountingManager final {
 
   std::weak_ptr<UIManager> uiManager_;
 
+  // The release coverage of the last group serialized per surface, guarded by
+  // allocatedViewsMutex_.
+  std::unordered_map<SurfaceId, uint64_t> serializedReleaseCoverages_;
+
   std::recursive_mutex commitMutex_;
 
   /*

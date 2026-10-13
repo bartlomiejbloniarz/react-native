@@ -3560,6 +3560,7 @@ std::optional<facebook::react::FilterType> facebook::react::filterTypeFromString
 std::optional<facebook::react::Float> facebook::react::optionalFloatFromYogaValue(const facebook::yoga::Style::Length& length, std::optional<facebook::react::Float> base = {});
 std::optional<facebook::react::FontVariant> facebook::react::fontVariantFromCSSFontVariant(facebook::react::CSSFontVariant cssVariant);
 std::optional<facebook::react::Isolation> facebook::react::isolationFromString(std::string_view isolationSetting);
+std::optional<facebook::react::MountedShadowView> facebook::react::findMountedShadowView(const facebook::react::ShadowNode& rootShadowNode, const facebook::react::ShadowNodeFamily& family);
 std::string facebook::react::componentNameByReactViewName(std::string viewName);
 std::string facebook::react::toString(const double& value);
 std::string facebook::react::toString(const facebook::react::AccessibilityRole& accessibilityRole);
@@ -3872,18 +3873,20 @@ class facebook::react::AnimatedNode {
   public void removeChild(facebook::react::Tag tag);
 }
 
-class facebook::react::AnimationBackend : public facebook::react::UIManagerAnimationBackend {
+class facebook::react::AnimationBackend : public facebook::react::UIManagerAnimationBackend, public std::enable_shared_from_this<facebook::react::AnimationBackend> {
   public AnimationBackend(std::shared_ptr<facebook::react::AnimationChoreographer> animationChoreographer, std::shared_ptr<facebook::react::UIManager> uiManager);
   public using PauseCallback = std::function<void()>;
   public using ResumeCallback = std::function<void()>;
   public virtual bool hasDirectWrites(facebook::react::SurfaceId surfaceId) override;
   public virtual facebook::react::CallbackId start(const facebook::react::UIManagerAnimationBackend::Callback& callback) override;
-  public virtual std::vector<folly::dynamic> newerDirectWrites(facebook::react::SurfaceId surfaceId, const std::vector<std::pair<facebook::react::Tag, uint64_t>>& stampedViews) override;
+  public virtual std::vector<folly::dynamic> newerDirectWrites(facebook::react::SurfaceId surfaceId, const std::vector<facebook::react::StampedView>& stampedViews) override;
   public virtual void clearRegistry(facebook::react::SurfaceId surfaceId) override;
   public virtual void clearRegistryOnSurfaceStop(facebook::react::SurfaceId surfaceId) override;
   public virtual void onAnimationFrame(facebook::react::AnimationTimestamp timestamp) override;
+  public virtual void own(const std::shared_ptr<const facebook::react::ShadowNodeFamily>& family, facebook::react::Tag propsNodeTag, const std::vector<std::string>& keys) override;
   public virtual void pushAnimationMutations(const facebook::react::UIManagerAnimationBackend::Callback& callback) override;
   public virtual void registerJSInvoker(std::shared_ptr<facebook::react::CallInvoker> jsInvoker) override;
+  public virtual void release(facebook::react::Tag propsNodeTag) override;
   public virtual void stop(facebook::react::CallbackId callbackId) override;
   public virtual void trigger() override;
   public void requestAsyncFlushForSurfaces(const std::set<facebook::react::SurfaceId>& surfaces);
@@ -5001,8 +5004,8 @@ class facebook::react::MountingCoordinator {
   public facebook::react::SurfaceId getSurfaceId() const;
   public std::optional<facebook::react::MountingTransaction> pullTransaction(bool willPerformAsynchronously = false) const;
   public void didPerformAsyncTransactions() const;
-  public void setFinalMountingOverrideDelegate(std::weak_ptr<const facebook::react::MountingOverrideDelegate> delegate) const;
   public void setMountingOverrideDelegate(std::weak_ptr<const facebook::react::MountingOverrideDelegate> delegate) const;
+  public void setTransactionFinalizer(std::weak_ptr<const facebook::react::MountingTransactionFinalizer> finalizer) const;
 }
 
 class facebook::react::MountingOverrideDelegate {
@@ -5030,6 +5033,12 @@ class facebook::react::MountingTransaction {
 struct facebook::react::MountingTransaction::AnimationStamp {
   public size_t firstMutation;
   public uint64_t number;
+  public uint64_t releaseCoverage;
+}
+
+class facebook::react::MountingTransactionFinalizer {
+  public virtual facebook::react::MountingTransaction finalizeTransaction(facebook::react::MountingTransaction transaction, const facebook::react::ShadowNode& root) const = 0;
+  public virtual ~MountingTransactionFinalizer() = default;
 }
 
 class facebook::react::NSDataBigString : public facebook::react::JSBigString {
@@ -6309,6 +6318,7 @@ class facebook::react::TransactionTelemetry {
   public int getRevisionNumber() const;
   public static facebook::react::TransactionTelemetry* threadLocalTelemetry();
   public uint64_t getAnimationStampNumber() const;
+  public uint64_t getReleaseCoverage() const;
   public void didCommit();
   public void didDiff();
   public void didLayout();
@@ -6317,6 +6327,7 @@ class facebook::react::TransactionTelemetry {
   public void didMount();
   public void setAnimationStampNumber(uint64_t animationStampNumber);
   public void setAsThreadLocal();
+  public void setReleaseCoverage(uint64_t releaseCoverage);
   public void setRevisionNumber(int revisionNumber);
   public void unsetAsThreadLocal();
   public void willCommit();
@@ -6409,13 +6420,16 @@ class facebook::react::UIManagerAnimationBackend {
   public using Callback = std::function<facebook::react::AnimationMutations(facebook::react::AnimationTimestamp)>;
   public virtual bool hasDirectWrites(facebook::react::SurfaceId);
   public virtual facebook::react::CallbackId start(const facebook::react::UIManagerAnimationBackend::Callback& callback) = 0;
+  public virtual folly::dynamic releasedValues(facebook::react::SurfaceId, facebook::react::Tag, uint64_t, uint64_t, const facebook::react::Props::Shared&);
   public virtual folly::dynamic restoreDirectWrites(facebook::react::SurfaceId, facebook::react::Tag, const facebook::react::Props::Shared&, const facebook::react::Props::Shared&);
-  public virtual std::vector<folly::dynamic> newerDirectWrites(facebook::react::SurfaceId, const std::vector<std::pair<facebook::react::Tag, uint64_t>>&);
+  public virtual std::vector<folly::dynamic> newerDirectWrites(facebook::react::SurfaceId, const std::vector<facebook::react::StampedView>&);
   public virtual void clearRegistry(facebook::react::SurfaceId surfaceId) = 0;
   public virtual void clearRegistryOnSurfaceStop(facebook::react::SurfaceId surfaceId) = 0;
   public virtual void onAnimationFrame(facebook::react::AnimationTimestamp timestamp) = 0;
+  public virtual void own(const std::shared_ptr<const facebook::react::ShadowNodeFamily>&, facebook::react::Tag, const std::vector<std::string>&);
   public virtual void pushAnimationMutations(const facebook::react::UIManagerAnimationBackend::Callback& callback) = 0;
   public virtual void registerJSInvoker(std::shared_ptr<facebook::react::CallInvoker> jsInvoker) = 0;
+  public virtual void release(facebook::react::Tag);
   public virtual void stop(facebook::react::CallbackId callbackId) = 0;
   public virtual void trigger() = 0;
   public virtual ~UIManagerAnimationBackend() = default;
@@ -7555,6 +7569,7 @@ enum facebook::react::ShadowTreeCommitMode {
 }
 
 enum facebook::react::ShadowTreeCommitSource {
+  AnimatedPropsRelease,
   AnimationEndSync,
   React,
   ReactRevisionMerge,
@@ -7812,6 +7827,7 @@ struct facebook::react::AnimationMutation {
   public facebook::react::AnimatedProps props;
   public facebook::react::Tag tag;
   public std::shared_ptr<const facebook::react::ShadowNodeFamily> family;
+  public std::unordered_set<std::string> finishedKeys;
 }
 
 struct facebook::react::AnimationMutations {
@@ -8373,6 +8389,11 @@ struct facebook::react::ModalHostViewSupportedOrientationsMaskWrapped {
   public facebook::react::ModalHostViewSupportedOrientationsMask value;
 }
 
+struct facebook::react::MountedShadowView {
+  public facebook::react::ShadowView shadowView;
+  public facebook::react::Tag parentTag;
+}
+
 struct facebook::react::Point {
   public bool operator==(const facebook::react::Point& rhs) const = default;
   public facebook::react::Float x;
@@ -8643,6 +8664,12 @@ struct facebook::react::Size {
   public facebook::react::Float width;
   public facebook::react::Size& operator*=(const facebook::react::Point& point) noexcept;
   public facebook::react::Size& operator+=(const facebook::react::Point& point) noexcept;
+}
+
+struct facebook::react::StampedView {
+  public facebook::react::Tag tag;
+  public uint64_t releaseCoverage;
+  public uint64_t stamp;
 }
 
 struct facebook::react::StateData {
