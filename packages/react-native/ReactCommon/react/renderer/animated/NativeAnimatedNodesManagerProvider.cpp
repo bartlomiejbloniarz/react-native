@@ -137,7 +137,7 @@ NativeAnimatedNodesManagerProvider::getOrCreate(
     animationBackend->registerJSInvoker(jsInvoker);
 
     nativeAnimatedNodesManager_ =
-        std::make_shared<NativeAnimatedNodesManager>(animationBackend);
+        NativeAnimatedNodesManager::create(animationBackend);
   }
 
   addEventEmitterListener(

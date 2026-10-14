@@ -15,23 +15,85 @@
 #include <folly/dynamic.h>
 #include <react/renderer/uimanager/UIManager.h>
 #include <react/renderer/uimanager/UIManagerCommitHook.h>
+#include <map>
+#include <set>
+#include <variant>
 #include "AnimatedProps.h"
 #include "AnimationMutation.h"
 
 namespace facebook::react {
 
 struct PropsSnapshot {
-  std::unique_ptr<BaseViewProps> props;
+  // Shared by the stamped snapshots that keep the same typed values.
+  std::shared_ptr<BaseViewProps> props;
   std::unordered_set<PropName> propNames;
   std::unique_ptr<folly::dynamic> rawProps;
 };
 
-struct SurfaceContext {
-  std::unordered_map<Tag, std::unique_ptr<PropsSnapshot>> pendingMap, map;
-  std::unordered_set<std::shared_ptr<const ShadowNodeFamily>> pendingFamilies, families;
+// The latest direct value of a key, written by a frontend that keeps its
+// direct values out of React commits.
+struct UncommittedValue {
+  folly::dynamic value;
+  AnimationFrontendId writer;
+  // The number of the writer's release of the key, 0 while it animates it.
+  uint64_t release{0};
+  bool commitValue{false};
+  // A release commit accepted the release; it is not committed again.
+  bool isReleaseCommitted{false};
 };
 
-using SnapshotMap = std::unordered_map<Tag, std::unique_ptr<PropsSnapshot>>;
+struct UncommittedView {
+  std::weak_ptr<const ShadowNodeFamily> family;
+  std::unordered_map<std::string, UncommittedValue> values;
+};
+
+// Stamped snapshots are shared with the commit hooks reading them, so they
+// are replaced, never changed.
+using SnapshotMap = std::unordered_map<Tag, std::shared_ptr<const PropsSnapshot>>;
+
+// A stamped typed prop, or a stamped raw key no typed prop includes.
+using StampedProp = std::variant<PropName, std::string>;
+
+// The frontend that stamped a prop last, and the number of its release of the
+// prop, 0 while it animates it.
+struct StampedWriter {
+  AnimationFrontendId frontendId;
+  uint64_t release{0};
+};
+
+struct StampedView {
+  std::weak_ptr<const ShadowNodeFamily> family;
+  std::unordered_map<StampedProp, StampedWriter> writers;
+};
+
+struct SurfaceContext {
+  std::unordered_map<Tag, std::unique_ptr<PropsSnapshot>> pendingMap;
+  SnapshotMap map;
+  std::unordered_set<std::shared_ptr<const ShadowNodeFamily>> pendingFamilies, families;
+  std::unordered_map<Tag, UncommittedView> uncommitted;
+  std::unordered_map<Tag, StampedView> stamped;
+};
+
+struct FrontendMutations {
+  AnimationFrontendId frontendId;
+  bool commitDirectProps;
+  AnimationMutations mutations;
+};
+
+// The views a release commit clones, with the values React adopts, and the
+// latest release it covers.
+struct ReleaseCommit {
+  uint64_t release{0};
+  std::vector<std::shared_ptr<const ShadowNodeFamily>> families;
+  std::unordered_map<Tag, folly::dynamic> adoptedValues;
+};
+
+// What a pulled transaction mounts for its views: the values that win over
+// React's, and the released values the views show until React's are mounted.
+struct PulledValues {
+  std::unordered_map<Tag, folly::dynamic> overlaid;
+  std::unordered_map<Tag, folly::dynamic> restored;
+};
 
 /*
  * Merges raw animated props per key, like the props merged by the animation
@@ -42,13 +104,32 @@ void mergeAnimatedRawProps(folly::dynamic &target, const folly::dynamic &source)
 class AnimatedPropsRegistry {
  public:
   void update(const std::vector<AnimationMutations> &batches);
+  void update(const FrontendMutations &batch);
+  // Returns the surfaces that need a release commit, and adds the restored
+  // values the views show to `restoredWrites`.
+  std::set<SurfaceId> release(
+      AnimationFrontendId frontendId,
+      const std::vector<AnimatedPropsRelease> &releases,
+      std::vector<AnimationMutation> &restoredWrites);
+  ReleaseCommit releaseCommit(SurfaceId surfaceId);
+  void didCommitReleases(SurfaceId surfaceId, uint64_t release);
+  // Stops stamping the props released up to `release`, once React adopted them.
+  void stopStamping(SurfaceId surfaceId, uint64_t release);
+  // `release` is the latest release the pulled revision covers.
+  PulledValues pull(SurfaceId surfaceId, uint64_t release, const std::vector<Tag> &tags);
   void initializeSurface(SurfaceId surfaceId);
   void clear(SurfaceId surfaceId);
   void clearOnSurfaceStop(SurfaceId surfaceId);
-  std::pair<std::unordered_set<std::shared_ptr<const ShadowNodeFamily>> &, SnapshotMap &> getMap(SurfaceId surfaceId);
+  std::pair<std::unordered_set<std::shared_ptr<const ShadowNodeFamily>>, SnapshotMap> getMap(SurfaceId surfaceId);
 
  private:
+  friend class AnimatedPropsRegistryFrontendTest;
+
+  void recordCommitted(AnimationFrontendId frontendId, const AnimationMutation &mutation);
+  void recordUncommitted(AnimationFrontendId frontendId, const AnimationMutation &mutation);
+
   std::unordered_map<SurfaceId, SurfaceContext> surfaceContexts_;
+  uint64_t releaseNumber_{0};
   std::mutex mutex_;
 };
 

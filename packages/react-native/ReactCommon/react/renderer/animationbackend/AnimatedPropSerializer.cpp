@@ -5,21 +5,31 @@
  * LICENSE file in the root directory of this source tree.
  */
 
+#include <folly/Conv.h>
 #include <react/renderer/graphics/Transform.h>
 #include <react/renderer/graphics/TransformUtils.h>
+#include <algorithm>
 #include <stdexcept>
+#include <unordered_map>
 #include "AnimatedPropsSerializer.h"
 
 namespace facebook::react {
 
 namespace {
 
+folly::dynamic packValueUnit(const ValueUnit& valueUnit) {
+  if (valueUnit.unit == UnitType::Percent) {
+    return folly::to<std::string>(valueUnit.value) + "%";
+  }
+  return valueUnit.value;
+}
+
 void packBorderRadiusCorner(
     folly::dynamic& dyn,
     const std::string& propName,
     const std::optional<ValueUnit>& cornerValue) {
   if (cornerValue.has_value()) {
-    dyn.insert(propName, cornerValue.value().value);
+    dyn.insert(propName, packValueUnit(cornerValue.value()));
   }
 }
 
@@ -44,7 +54,7 @@ void packBorderRadii(
   packBorderRadiusCorner(dyn, "borderEndEndRadius", borderRadii.endEnd);
 
   if (borderRadii.all.has_value()) {
-    dyn.insert("borderRadius", borderRadii.all.value().value);
+    dyn.insert("borderRadius", packValueUnit(borderRadii.all.value()));
   }
 }
 
@@ -147,6 +157,11 @@ void packBorderColor(
   packBorderColorEdge(dyn, "borderBottomColor", borderColors.bottom);
   packBorderColorEdge(dyn, "borderStartColor", borderColors.start);
   packBorderColorEdge(dyn, "borderEndColor", borderColors.end);
+  packBorderColorEdge(dyn, "borderHorizontalColor", borderColors.horizontal);
+  packBorderColorEdge(dyn, "borderVerticalColor", borderColors.vertical);
+  packBorderColorEdge(dyn, "borderBlockColor", borderColors.block);
+  packBorderColorEdge(dyn, "borderBlockStartColor", borderColors.blockStart);
+  packBorderColorEdge(dyn, "borderBlockEndColor", borderColors.blockEnd);
 
   if (borderColors.all.has_value() && borderColors.all.value()) {
     dyn.insert("borderColor", static_cast<int32_t>(*borderColors.all.value()));
@@ -244,6 +259,14 @@ void packBorderCurves(
   packBorderCurveEdge(dyn, "borderTopRightCurve", borderCurves.topRight);
   packBorderCurveEdge(dyn, "borderBottomLeftCurve", borderCurves.bottomLeft);
   packBorderCurveEdge(dyn, "borderBottomRightCurve", borderCurves.bottomRight);
+  packBorderCurveEdge(dyn, "borderTopStartCurve", borderCurves.topStart);
+  packBorderCurveEdge(dyn, "borderTopEndCurve", borderCurves.topEnd);
+  packBorderCurveEdge(dyn, "borderBottomStartCurve", borderCurves.bottomStart);
+  packBorderCurveEdge(dyn, "borderBottomEndCurve", borderCurves.bottomEnd);
+  packBorderCurveEdge(dyn, "borderStartStartCurve", borderCurves.startStart);
+  packBorderCurveEdge(dyn, "borderStartEndCurve", borderCurves.startEnd);
+  packBorderCurveEdge(dyn, "borderEndStartCurve", borderCurves.endStart);
+  packBorderCurveEdge(dyn, "borderEndEndCurve", borderCurves.endEnd);
 
   if (borderCurves.all.has_value()) {
     std::string curveStr;
@@ -294,6 +317,11 @@ void packBorderStyles(
   packBorderStyleEdge(dyn, "borderBottomStyle", borderStyles.bottom);
   packBorderStyleEdge(dyn, "borderStartStyle", borderStyles.start);
   packBorderStyleEdge(dyn, "borderEndStyle", borderStyles.end);
+  packBorderStyleEdge(dyn, "borderHorizontalStyle", borderStyles.horizontal);
+  packBorderStyleEdge(dyn, "borderVerticalStyle", borderStyles.vertical);
+  packBorderStyleEdge(dyn, "borderBlockStyle", borderStyles.block);
+  packBorderStyleEdge(dyn, "borderBlockStartStyle", borderStyles.blockStart);
+  packBorderStyleEdge(dyn, "borderBlockEndStyle", borderStyles.blockEnd);
 
   if (borderStyles.all.has_value()) {
     dyn.insert("borderStyle", borderStyleToString(borderStyles.all.value()));
@@ -700,10 +728,168 @@ folly::dynamic packAnimatedProps(const AnimatedProps& animatedProps) {
                                     : folly::dynamic::object();
 
   for (auto& animatedProp : animatedProps.props) {
-    packAnimatedProp(dyn, animatedProp);
+    react::packAnimatedProp(dyn, animatedProp);
   }
 
   return dyn;
+}
+
+folly::dynamic packAnimatedProp(
+    const std::unique_ptr<AnimatedPropBase>& animatedProp) {
+  folly::dynamic dyn = folly::dynamic::object();
+  react::packAnimatedProp(dyn, animatedProp);
+  return dyn;
+}
+
+folly::dynamic packBorderProp(
+    PropName propName,
+    const BaseViewProps& viewProps) {
+  folly::dynamic dyn = folly::dynamic::object();
+  switch (propName) {
+    case BORDER_RADII:
+      packBorderRadii(
+          dyn,
+          AnimatedProp<CascadedBorderRadii>{propName, viewProps.borderRadii});
+      break;
+    case BORDER_COLOR:
+      packBorderColor(
+          dyn,
+          AnimatedProp<CascadedBorderColors>{propName, viewProps.borderColors});
+      break;
+    case BORDER_CURVES:
+      packBorderCurves(
+          dyn,
+          AnimatedProp<CascadedBorderCurves>{propName, viewProps.borderCurves});
+      break;
+    case BORDER_STYLES:
+      packBorderStyles(
+          dyn,
+          AnimatedProp<CascadedBorderStyles>{propName, viewProps.borderStyles});
+      break;
+    default:
+      break;
+  }
+  return dyn;
+}
+
+std::optional<PropName> borderPropName(const std::string& key) {
+  if (!key.starts_with("border")) {
+    return std::nullopt;
+  }
+  if (key.ends_with("Radius")) {
+    return BORDER_RADII;
+  }
+  if (key.ends_with("Color")) {
+    return BORDER_COLOR;
+  }
+  if (key.ends_with("Curve")) {
+    return BORDER_CURVES;
+  }
+  if (key.ends_with("Style")) {
+    return BORDER_STYLES;
+  }
+  return std::nullopt;
+}
+
+bool writesKey(
+    const folly::dynamic* rawValues,
+    const AnimatedProps& props,
+    const std::string& key) {
+  if (rawValues != nullptr && rawValues->count(key) != 0) {
+    return true;
+  }
+  auto propName = singleKeyPropName(key);
+  if (!propName) {
+    propName = borderPropName(key);
+  }
+  return propName &&
+      std::any_of(
+             props.props.begin(),
+             props.props.end(),
+             [&](const auto& animatedProp) {
+               return animatedProp->propName == *propName;
+             });
+}
+
+std::optional<PropName> propNameOfKey(const std::string& key) {
+  static const std::unordered_map<std::string, PropName> layoutPropNames{
+      {"width", WIDTH},
+      {"height", HEIGHT},
+      {"flex", FLEX},
+      {"flexBasis", FLEX_BASIS},
+      {"flexDirection", FLEX_DIRECTION},
+      {"flexGrow", FLEX_GROW},
+      {"flexShrink", FLEX_SHRINK},
+      {"flexWrap", FLEX_WRAP},
+      {"alignContent", ALIGN_CONTENT},
+      {"alignItems", ALIGN_ITEMS},
+      {"alignSelf", ALIGN_SELF},
+      {"aspectRatio", ASPECT_RATIO},
+      {"boxSizing", BOX_SIZING},
+      {"display", DISPLAY},
+      {"justifyContent", JUSTIFY_CONTENT},
+      {"maxHeight", MAX_HEIGHT},
+      {"maxWidth", MAX_WIDTH},
+      {"minHeight", MIN_HEIGHT},
+      {"minWidth", MIN_WIDTH},
+      {"overflow", STYLE_OVERFLOW},
+      {"position", POSITION_TYPE},
+      {"zIndex", Z_INDEX},
+      {"direction", DIRECTION},
+      {"rowGap", ROW_GAP},
+      {"columnGap", COLUMN_GAP},
+      {"top", POSITION},
+      {"bottom", POSITION},
+      {"left", POSITION},
+      {"right", POSITION},
+      {"start", POSITION},
+      {"end", POSITION},
+      {"insetInline", POSITION},
+      {"insetBlock", POSITION},
+  };
+  if (auto propName = singleKeyPropName(key)) {
+    return propName;
+  }
+  if (key.starts_with("border") && key.ends_with("Width")) {
+    return BORDER_WIDTH;
+  }
+  if (auto propName = borderPropName(key)) {
+    return propName;
+  }
+  if (key.starts_with("margin")) {
+    return MARGIN;
+  }
+  if (key.starts_with("padding")) {
+    return PADDING;
+  }
+  auto it = layoutPropNames.find(key);
+  return it != layoutPropNames.end() ? std::optional(it->second) : std::nullopt;
+}
+
+std::optional<PropName> singleKeyPropName(const std::string& key) {
+  static const std::unordered_map<std::string, PropName> propNames{
+      {"opacity", OPACITY},
+      {"transform", TRANSFORM},
+      {"transformOrigin", TRANSFORM_ORIGIN},
+      {"backgroundColor", BACKGROUND_COLOR},
+      {"shadowColor", SHADOW_COLOR},
+      {"shadowOffset", SHADOW_OFFSET},
+      {"shadowOpacity", SHADOW_OPACITY},
+      {"shadowRadius", SHADOW_RADIUS},
+      {"filter", FILTER},
+      {"outlineColor", OUTLINE_COLOR},
+      {"outlineOffset", OUTLINE_OFFSET},
+      {"outlineStyle", OUTLINE_STYLE},
+      {"outlineWidth", OUTLINE_WIDTH},
+      {"pointerEvents", POINTER_EVENTS},
+      {"isolation", ISOLATION},
+      {"cursor", CURSOR},
+      {"boxShadow", BOX_SHADOW},
+      {"mixBlendMode", MIX_BLEND_MODE},
+      {"backfaceVisibility", BACKFACE_VISIBILITY},
+  };
+  auto it = propNames.find(key);
+  return it != propNames.end() ? std::optional(it->second) : std::nullopt;
 }
 
 } // namespace animationbackend

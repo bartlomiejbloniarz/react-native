@@ -14,10 +14,12 @@
 #include <react/renderer/uimanager/UIManager.h>
 #include <react/renderer/uimanager/UIManagerAnimationBackend.h>
 #include <functional>
+#include <map>
 #include <memory>
 #include <mutex>
 #include <set>
 #include <unordered_map>
+#include <unordered_set>
 #include <vector>
 #include "AnimatedProps.h"
 #include "AnimationChoreographer.h"
@@ -36,7 +38,14 @@ struct CallbackWithId {
   Callback callback;
 };
 
-class AnimationBackend : public UIManagerAnimationBackend {
+struct FrameCallback {
+  AnimationFrontendId frontendId;
+  Callback callback;
+};
+
+struct FrontendMutations;
+
+class AnimationBackend : public UIManagerAnimationBackend, public std::enable_shared_from_this<AnimationBackend> {
  public:
   using ResumeCallback = std::function<void()>;
   using PauseCallback = std::function<void()>;
@@ -53,23 +62,56 @@ class AnimationBackend : public UIManagerAnimationBackend {
 
   void onAnimationFrame(AnimationTimestamp timestamp) override;
   void trigger() override;
+  AnimationFrontendId registerFrontend(AnimationFrontend frontend) override;
+  void start(AnimationFrontendId frontendId) override;
+  void stop(AnimationFrontendId frontendId) override;
+  void pushAnimationMutations(AnimationFrontendId frontendId, const Callback &callback) override;
+  // A release requested while the backend runs a frontend's callback ends the
+  // values written before the callback, unless it commits the values: then it
+  // also commits the callback's values.
+  void release(AnimationFrontendId frontendId, std::vector<AnimatedPropsRelease> releases) override;
   void pushAnimationMutations(const Callback &callback) override;
   CallbackId start(const Callback &callback) override;
   void stop(CallbackId callbackId) override;
 
  private:
+  static constexpr AnimationFrontendId kDefaultFrontend{0};
   using SurfaceUpdates = std::unordered_map<Tag, AnimationMutation>;
+  // Per view, the keys whose latest value in a frame stays out of commits.
+  using UncommittedKeys = std::unordered_map<Tag, std::unordered_set<std::string>>;
 
   void commitUpdates(SurfaceId surfaceId, SurfaceUpdates &surfaceUpdates);
   void unpackMutations(
-      AnimationMutations &mutations,
+      FrontendMutations &batch,
       std::unordered_map<SurfaceId, SurfaceUpdates> &surfaceUpdates,
-      std::set<SurfaceId> &asyncFlushSurfaces);
+      std::unordered_map<SurfaceId, UncommittedKeys> &uncommittedKeys,
+      std::map<SurfaceId, bool> &releaseCommits);
   void applySurfaceUpdates(
       std::unordered_map<SurfaceId, SurfaceUpdates> &surfaceUpdates,
-      const std::set<SurfaceId> &asyncFlushSurfaces);
-  void applyMutations(std::vector<AnimationMutations> batches);
+      std::unordered_map<SurfaceId, UncommittedKeys> &uncommittedKeys);
+  // Runs the callbacks and records each one's mutations and releases in
+  // order, then writes the mutations to views.
+  void runCallbacks(const std::vector<FrameCallback> &callbacksToRun, AnimationTimestamp timestamp);
+  void recordReleases(
+      const std::vector<std::pair<AnimationFrontendId, AnimatedPropsRelease>> &releases,
+      bool commitValues,
+      std::map<SurfaceId, bool> &releaseCommits,
+      std::vector<AnimationMutation> &restoredWrites);
+  // Queues one release commit per surface; `true` when it adopts values (an
+  // end sync).
+  void requestReleaseCommits(const std::map<SurfaceId, bool> &releaseCommits);
+  void postReleaseCommit(SurfaceId surfaceId);
+  void commitReleases(SurfaceId surfaceId);
+  bool commitsDirectProps(AnimationFrontendId frontendId);
+  bool hasFrameCallbacks() const;
+  void resumeFrames();
+  void pauseFramesIfIdle();
+  friend class AnimationBackendFrontendTest;
   std::vector<CallbackWithId> callbacks;
+  std::vector<AnimationFrontend> frontends_{AnimationFrontend{}};
+  std::vector<bool> startedFrontends_{false};
+  std::map<SurfaceId, bool> queuedReleaseCommits_;
+  std::map<SurfaceId, bool> cancelledReleaseCommits_;
   std::shared_ptr<AnimatedPropsRegistry> animatedPropsRegistry_;
   std::shared_ptr<AnimationChoreographer> animationChoreographer_;
   std::unique_ptr<AnimationBackendCommitHook> commitHook_;

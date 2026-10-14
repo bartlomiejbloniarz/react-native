@@ -69,7 +69,9 @@ class NativeAnimatedNodesManager : public std::enable_shared_from_this<NativeAni
       StopOnRenderCallback &&stopOnRenderCallback = nullptr,
       FrameRateListenerCallback &&frameRateListenerCallback = nullptr) noexcept;
 
-  explicit NativeAnimatedNodesManager(std::shared_ptr<UIManagerAnimationBackend> animationBackend) noexcept;
+  // Registers the manager as a frontend of the shared backend.
+  static std::shared_ptr<NativeAnimatedNodesManager> create(
+      std::shared_ptr<UIManagerAnimationBackend> animationBackend);
 
   ~NativeAnimatedNodesManager() noexcept;
 
@@ -166,7 +168,8 @@ class NativeAnimatedNodesManager : public std::enable_shared_from_this<NativeAni
       const folly::dynamic &props,
       bool layoutStyleUpdated,
       bool forceFabricCommit,
-      ShadowNodeFamily::Weak shadowNodeFamily = {}) noexcept;
+      ShadowNodeFamily::Weak shadowNodeFamily = {},
+      Tag propsNodeTag = 0) noexcept;
 
   /**
    * Commits all pending animated property updates to their respective views.
@@ -214,7 +217,13 @@ class NativeAnimatedNodesManager : public std::enable_shared_from_this<NativeAni
   void resolvePlatformColor(SurfaceId surfaceId, const RawValue &value, SharedColor &result) const;
 
  private:
+  explicit NativeAnimatedNodesManager(std::shared_ptr<UIManagerAnimationBackend> animationBackend) noexcept;
+
   void stopRenderCallbackIfNeeded(bool isAsync) noexcept;
+  // Hands the view's keys the props node wrote last back to React.
+  void releaseProps(Tag viewTag, Tag propsNodeTag, const ShadowNodeFamily::Shared &family);
+  // React adopts the values of the animations that finished in this frame.
+  void releaseFinishedProps();
 
   bool onAnimationFrame(double timestamp);
 
@@ -227,6 +236,7 @@ class NativeAnimatedNodesManager : public std::enable_shared_from_this<NativeAni
   void handleAnimatedEvent(Tag tag, const std::string &eventName, const EventPayload &payload) noexcept;
 
   std::weak_ptr<UIManagerAnimationBackend> animationBackend_;
+  AnimationFrontendId frontendId_{0};
 
   // Latched per-instance copy of which backend this manager uses, set from the
   // constructor that ran (true for the shared-AnimationBackend ctor). Reads stay
@@ -283,7 +293,11 @@ class NativeAnimatedNodesManager : public std::enable_shared_from_this<NativeAni
   std::unordered_map<Tag, folly::dynamic> updateViewPropsDirect_{};
   std::unordered_map<Tag, std::pair<ShadowNodeFamily::Weak, folly::dynamic>> updateViewPropsForBackend_{};
   std::unordered_map<Tag, std::pair<ShadowNodeFamily::Weak, folly::dynamic>> updateViewPropsDirectForBackend_{};
-  std::unordered_set<Tag> shouldRequestAsyncFlush_{};
+  // Per view, the props node that wrote each key last.
+  std::unordered_map<Tag, std::unordered_map<std::string, Tag>> propsWriters_{};
+  // Per view, the keys whose animation finished with their latest write in
+  // this frame.
+  std::unordered_map<Tag, std::pair<ShadowNodeFamily::Weak, std::unordered_set<std::string>>> finishedKeys_{};
   /*
    * Sometimes a view is not longer connected to a PropsAnimatedNode, but
    * NativeAnimated has previously changed the view's props via direct
@@ -299,10 +313,9 @@ class NativeAnimatedNodesManager : public std::enable_shared_from_this<NativeAni
   bool warnedAboutGraphTraversal_ = false;
 #endif
 
-  // Protects the register/publish and exchange/stop lifecycle for the shared
-  // AnimationBackend callback.
+  // Keeps isRenderCallbackStarted_ and the shared backend's started state in
+  // step.
   std::mutex animationBackendCallbackMutex_;
-  std::optional<CallbackId> animationBackendCallbackId_;
 
   friend class ColorAnimatedNode;
   friend class AnimationDriver;

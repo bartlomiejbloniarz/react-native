@@ -127,6 +127,23 @@ NativeAnimatedNodesManager::NativeAnimatedNodesManager(
     std::shared_ptr<UIManagerAnimationBackend> animationBackend) noexcept
     : animationBackend_(animationBackend), useSharedAnimatedBackend_(true) {}
 
+std::shared_ptr<NativeAnimatedNodesManager> NativeAnimatedNodesManager::create(
+    std::shared_ptr<UIManagerAnimationBackend> animationBackend) {
+  std::shared_ptr<NativeAnimatedNodesManager> manager(
+      new NativeAnimatedNodesManager(animationBackend));
+  manager->frontendId_ = animationBackend->registerFrontend(
+      {.commitDirectProps = false,
+       .onAnimationFrame =
+           [weak = std::weak_ptr(manager)](
+               AnimationTimestamp timestamp) -> AnimationMutations {
+         if (auto self = weak.lock()) {
+           return self->pullAnimationMutations(timestamp);
+         }
+         return {};
+       }});
+  return manager;
+}
+
 NativeAnimatedNodesManager::~NativeAnimatedNodesManager() noexcept {
   stopRenderCallbackIfNeeded(true);
 }
@@ -288,6 +305,7 @@ void NativeAnimatedNodesManager::disconnectAnimatedNodeFromView(
   if (node != nullptr) {
     node->disconnectFromView(viewTag);
     if (useSharedAnimatedBackend_) {
+      releaseProps(viewTag, propsNodeTag, node->shadowNodeFamily());
       node->disconnectFromShadowNodeFamily();
     }
     {
@@ -324,6 +342,55 @@ void NativeAnimatedNodesManager::disconnectAnimatedNodes(
 void NativeAnimatedNodesManager::restoreDefaultValues(Tag tag) noexcept {
   if (auto propsNode = getAnimatedNode<PropsAnimatedNode>(tag)) {
     propsNode->restoreDefaultValues();
+    if (useSharedAnimatedBackend_) {
+      releaseProps(
+          propsNode->connectedViewTag(), tag, propsNode->shadowNodeFamily());
+    }
+  }
+}
+
+void NativeAnimatedNodesManager::releaseProps(
+    Tag viewTag,
+    Tag propsNodeTag,
+    const ShadowNodeFamily::Shared& family) {
+  auto writersIt = propsWriters_.find(viewTag);
+  if (writersIt == propsWriters_.end()) {
+    return;
+  }
+  std::vector<std::string> keys;
+  std::erase_if(writersIt->second, [&](const auto& writer) {
+    if (writer.second != propsNodeTag) {
+      return false;
+    }
+    keys.push_back(writer.first);
+    return true;
+  });
+  if (writersIt->second.empty()) {
+    propsWriters_.erase(writersIt);
+  }
+  auto animationBackend = animationBackend_.lock();
+  if (keys.empty() || !family || !animationBackend) {
+    return;
+  }
+  animationBackend->release(
+      frontendId_, {{.family = family, .keys = std::move(keys)}});
+}
+
+void NativeAnimatedNodesManager::releaseFinishedProps() {
+  std::vector<AnimatedPropsRelease> releases;
+  for (auto& [viewTag, finished] : finishedKeys_) {
+    auto& [weakFamily, keys] = finished;
+    if (auto family = weakFamily.lock(); family && !keys.empty()) {
+      releases.push_back(
+          {.family = std::move(family),
+           .keys = {keys.begin(), keys.end()},
+           .commitValues = true});
+    }
+  }
+  finishedKeys_.clear();
+  auto animationBackend = animationBackend_.lock();
+  if (!releases.empty() && animationBackend) {
+    animationBackend->release(frontendId_, std::move(releases));
   }
 }
 
@@ -555,6 +622,7 @@ void NativeAnimatedNodesManager::handleAnimatedEvent(
     if (useSharedAnimatedBackend_) {
       if (auto animationBackend = animationBackend_.lock()) {
         animationBackend->pushAnimationMutations(
+            frontendId_,
             [this](AnimationTimestamp timestamp) -> AnimationMutations {
               return pullAnimationMutations(timestamp);
             });
@@ -603,23 +671,10 @@ void NativeAnimatedNodesManager::startRenderCallbackIfNeeded(bool isAsync) {
     if (!animationBackend) {
       return;
     }
-    // AnimationBackend::start registers the callback before returning the id.
-    // Keep registration and id publication in one critical section; otherwise a
-    // concurrent stop can observe no id and leave the registered callback
-    // orphaned in the backend.
     std::lock_guard<std::mutex> lock(animationBackendCallbackMutex_);
-    if (animationBackendCallbackId_.has_value()) {
-      return;
+    if (!isRenderCallbackStarted_.exchange(true)) {
+      animationBackend->start(frontendId_);
     }
-    auto weak = weak_from_this();
-    auto callbackId = animationBackend->start(
-        [weak](AnimationTimestamp timestamp) -> AnimationMutations {
-          if (auto self = weak.lock()) {
-            return self->pullAnimationMutations(timestamp);
-          }
-          return {};
-        });
-    animationBackendCallbackId_ = callbackId;
   }
 }
 
@@ -645,20 +700,9 @@ void NativeAnimatedNodesManager::stopRenderCallbackIfNeeded(
 
   {
     auto animationBackend = animationBackend_.lock();
-    CallbackId callbackId = 0;
-    {
-      std::lock_guard<std::mutex> lock(animationBackendCallbackMutex_);
-      if (!animationBackendCallbackId_.has_value()) {
-        return;
-      }
-      // Clear the published id while holding the same mutex that protects
-      // start registration. This makes a concurrent start either see an active
-      // callback or wait until this stop owns the callback id.
-      callbackId = *animationBackendCallbackId_;
-      animationBackendCallbackId_.reset();
-    }
-    if (animationBackend) {
-      animationBackend->stop(callbackId);
+    std::lock_guard<std::mutex> lock(animationBackendCallbackMutex_);
+    if (isRenderCallbackStarted_.exchange(false) && animationBackend) {
+      animationBackend->stop(frontendId_);
     }
   }
 }
@@ -975,10 +1019,21 @@ void NativeAnimatedNodesManager::schedulePropsCommit(
     const folly::dynamic& props,
     bool layoutStyleUpdated,
     bool forceFabricCommit,
-    ShadowNodeFamily::Weak shadowNodeFamily) noexcept {
+    ShadowNodeFamily::Weak shadowNodeFamily,
+    Tag propsNodeTag) noexcept {
   if (useSharedAnimatedBackend_) {
-    if (forceFabricCommit) {
-      shouldRequestAsyncFlush_.insert(viewTag);
+    auto& writers = propsWriters_[viewTag];
+    for (const auto& [key, _] : props.items()) {
+      auto keyName = key.getString();
+      writers[keyName] = propsNodeTag;
+      if (forceFabricCommit) {
+        auto& [family, keys] = finishedKeys_[viewTag];
+        family = shadowNodeFamily;
+        keys.insert(std::move(keyName));
+      } else if (auto it = finishedKeys_.find(viewTag);
+                 it != finishedKeys_.end()) {
+        it->second.second.erase(keyName);
+      }
     }
     auto& current = layoutStyleUpdated
         ? updateViewPropsForBackend_[viewTag]
@@ -1021,9 +1076,6 @@ void NativeAnimatedNodesManager::insertMutations(
 
     if (auto family = weakFamily.lock()) {
       propsBuilder.storeDynamic(update.second);
-      if (shouldRequestAsyncFlush_.contains(tag)) {
-        mutations.asyncFlushSurfaces.insert(family->getSurfaceId());
-      }
       mutations.batch.push_back(
           AnimationMutation{
               .tag = tag,
@@ -1150,7 +1202,7 @@ AnimationMutations NativeAnimatedNodesManager::pullAnimationMutations(
     // There is no active animation. Stop the render callback.
     stopRenderCallbackIfNeeded(false);
   }
-  shouldRequestAsyncFlush_.clear();
+  releaseFinishedProps();
   return mutations;
 }
 

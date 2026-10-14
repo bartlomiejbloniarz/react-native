@@ -184,7 +184,8 @@ void PropsAnimatedNode::update(bool forceFabricCommit) {
         props_,
         layoutStyleUpdated_,
         forceFabricCommit,
-        shadowNodeFamily_);
+        shadowNodeFamily_,
+        tag());
   } else {
     manager_->schedulePropsCommit(
         connectedViewTag_, props_, layoutStyleUpdated_, forceFabricCommit);
