@@ -487,7 +487,11 @@ std::optional<ShadowTreeRevision> ShadowTree::getCurrentReactRevision() const {
 
 void ShadowTree::mount(ShadowTreeRevision revision, bool mountSynchronously)
     const {
-  mountingCoordinator_->push(std::move(revision));
+  if (!mountingCoordinator_->push(
+          std::move(revision),
+          /* dropIfAlreadyPulled */ isPropsUpdatesAccumulationGuaranteed())) {
+    return;
+  }
   delegate_.shadowTreeDidFinishTransaction(
       mountingCoordinator_, mountSynchronously);
 }

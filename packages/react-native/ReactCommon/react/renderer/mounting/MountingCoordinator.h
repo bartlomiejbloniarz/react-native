@@ -111,7 +111,7 @@ class MountingCoordinator final {
  private:
   friend class ShadowTree;
 
-  void push(ShadowTreeRevision revision) const;
+  bool push(ShadowTreeRevision revision, bool dropIfAlreadyPulled) const;
 
   /*
    * Revokes the last pushed `ShadowTreeRevision`.

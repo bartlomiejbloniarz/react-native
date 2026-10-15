@@ -36,12 +36,18 @@ SurfaceId MountingCoordinator::getSurfaceId() const {
   return surfaceId_;
 }
 
-void MountingCoordinator::push(ShadowTreeRevision revision) const {
+bool MountingCoordinator::push(
+    ShadowTreeRevision revision,
+    bool dropIfAlreadyPulled) const {
   {
     std::scoped_lock lock(mutex_);
 
     react_native_assert(
         !lastRevision_.has_value() || revision.number != lastRevision_->number);
+
+    if (dropIfAlreadyPulled && revision.number <= baseRevision_.number) {
+      return false;
+    }
 
     if (!lastRevision_.has_value() || lastRevision_->number < revision.number) {
       lastRevision_ = std::move(revision);
@@ -49,6 +55,7 @@ void MountingCoordinator::push(ShadowTreeRevision revision) const {
   }
 
   signal_.notify_all();
+  return true;
 }
 
 void MountingCoordinator::revoke() const {
